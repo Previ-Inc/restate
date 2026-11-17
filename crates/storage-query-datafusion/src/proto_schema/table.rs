@@ -87,7 +87,9 @@ fn append_proto_schema_row(
     }
 }
 
-impl<SMR: ServiceMetadataResolver + Sync + Send + 'static> Scan for ProtoSchemasScanner<SMR> {
+impl<SMR: ServiceMetadataResolver + Sync + Send + Clone + 'static> Scan
+    for ProtoSchemasScanner<SMR>
+{
     fn scan(
         &self,
         projection: SchemaRef,
@@ -98,9 +100,10 @@ impl<SMR: ServiceMetadataResolver + Sync + Send + 'static> Scan for ProtoSchemas
         let schema = projection.clone();
         let mut stream_builder = RecordBatchReceiverStream::builder(projection, 16);
         let tx = stream_builder.tx();
-        let services = self.0.list_all_service_schemas();
+        let registry = self.0.clone();
 
         stream_builder.spawn(async move {
+            let services = registry.list_all_service_schemas();
             let mut builder = SysProtoSchemasBuilder::new(schema);
             for svc in services {
                 let mut keys: Vec<(&str, &Arc<super::CompiledMessageSchema>)> = svc
