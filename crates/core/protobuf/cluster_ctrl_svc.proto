@@ -51,6 +51,12 @@ service ClusterCtrlSvc {
   // partitions. An empty list means all known partitions.
   rpc SyncEpochMetadata(SyncEpochMetadataRequest)
       returns (SyncEpochMetadataResponse);
+
+  // Checks whether all logs and partitions are available given the nodes that
+  // are alive, optionally assuming that additional nodes are dead. Only the
+  // cluster controller leader answers this request.
+  rpc CheckClusterSafety(CheckClusterSafetyRequest)
+      returns (CheckClusterSafetyResponse);
 }
 
 message SetClusterConfigurationResponse {}
@@ -125,19 +131,40 @@ message CreatePartitionSnapshotResponse {
 // Deletes a single node's local copy of a partition. All data the node holds
 // for this partition is lost; it can only be recovered from a snapshot or by
 // replaying the log. This is intended for recovering a node whose partition
-// store has been sealed (see BrokenReason).
+// store has been sealed (see BrokenReason), and for removing stores that the
+// node keeps although it is no longer part of the partition's replica set.
 message DropPartitionStoreRequest {
   uint32 partition_id = 1;
   // The node to delete the partition store from
   restate.common.NodeId node_id = 2;
-  // Stop a running partition processor before deleting. Without this, the node
-  // rejects the request unless it has already given up on the partition.
+  // Skip the safety checks and stop a running partition processor before
+  // deleting. Without this, the node only deletes a store that no processor
+  // uses: either it has already given up on the partition, or it is neither
+  // running the partition nor part of its replica set.
   bool force = 3;
+  // The newest partition configuration version that the caller based its
+  // decision on. Without force, a node that doesn't know this version yet waits
+  // a few seconds for it, and refuses if it doesn't arrive. Unset doesn't wait.
+  optional restate.common.Version min_partition_configuration_version = 4;
+  // Why the store is being dropped. Logged for auditing.
+  string reason = 5;
+  // Only report what would happen, without changing anything. The node makes
+  // the same checks, and answers as if it had dropped the store.
+  bool dry_run = 6;
 }
 
 message DropPartitionStoreResponse {
-  // False if the node had no local partition store to delete
+  // False if the node had no local partition store to delete. In a dry run,
+  // whether it would delete one.
   bool dropped = 1;
+  // How much disk space the deleted store used, in bytes, right before the
+  // deletion (in a dry run, how much it uses). Unset if nothing was dropped or
+  // it couldn't be measured.
+  optional uint64 deleted_bytes = 2;
+  // Whether the node handled the request as a dry run, without changing
+  // anything. Servers that don't support dry runs never set it: if a dry run was
+  // requested but this is false, `dropped` reports a real deletion.
+  bool dry_run = 3;
 }
 
 message ChainExtension {
@@ -241,3 +268,63 @@ message SyncEpochMetadataRequest {
 }
 
 message SyncEpochMetadataResponse {}
+
+message CheckClusterSafetyRequest {
+  // Nodes to consider dead in addition to the nodes that are not alive. Use
+  // this to check whether it is safe to take these nodes down.
+  repeated uint32 assume_dead_nodes = 1;
+}
+
+message CheckClusterSafetyResponse {
+  // Logs that cannot accept writes, neither on their tail segment nor after a
+  // reconfiguration.
+  repeated uint32 write_unavailable_logs = 1;
+  // Logs with at least one segment whose records cannot be reliably read.
+  repeated uint32 read_unavailable_logs = 2;
+  // Write-available logs that lose write availability if a single failure
+  // domain fails. Domains are at the greatest scope of each log's replication
+  // property (including the default replication of new segments), e.g. zones
+  // for `{zone: 2}`.
+  repeated uint32 write_at_risk_logs = 3;
+  // Read-available logs that lose read availability if a single failure domain
+  // fails.
+  repeated uint32 read_at_risk_logs = 4;
+  // Logs that cannot be evaluated because they use non-replicated loglets.
+  repeated uint32 unchecked_logs = 5;
+  // Partitions without an alive replica that the cluster controller cannot
+  // move to other nodes, e.g. because their placement is frozen, or whose
+  // leadership is frozen on a dead node.
+  repeated uint32 unavailable_partitions = 6;
+  // Available partitions that lose availability if a single failure domain
+  // fails. Domains are at the greatest scope of the partition replication.
+  repeated uint32 at_risk_partitions = 7;
+  // Partitions whose placement is not yet known to the cluster controller, or
+  // whose leadership is frozen while neither the cluster controller nor any
+  // alive replica knows their leader.
+  repeated uint32 unchecked_partitions = 8;
+  // What losing each failure domain alone would make unavailable, for the
+  // domains whose loss makes anything unavailable.
+  repeated DomainImpact domain_impacts = 9;
+  // The greatest scope of the replication of the checked logs and partitions:
+  // one of `node`, `zone`, or `region`. Unset if there was nothing to check.
+  optional string scope = 10;
+  // Nodes that are considered dead, not counting `assume_dead_nodes`.
+  repeated uint32 dead_nodes = 11;
+  uint32 num_logs = 12;
+  uint32 num_partitions = 13;
+}
+
+message DomainImpact {
+  FailureDomain domain = 1;
+  repeated uint32 write_unavailable_logs = 2;
+  repeated uint32 read_unavailable_logs = 3;
+  repeated uint32 unavailable_partitions = 4;
+}
+
+message FailureDomain {
+  // One of `node`, `zone`, or `region`
+  string scope = 1;
+  // The node id for the node scope, otherwise the location, e.g.
+  // `region1.zone1`
+  string name = 2;
+}

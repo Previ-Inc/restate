@@ -13,15 +13,23 @@
 //! This module provides utilities to decode values stored in the partition-store
 //! using the appropriate decoder for each table type.
 
+use std::fmt::Write;
+
 use bilrost::OwnedMessage;
 
 use restate_limiter::RuleBook;
 use restate_partition_store::PartitionSeal;
+use restate_partition_store::blob_table::{BlobHeader, BlobKey};
 use restate_partition_store::fsm_table::PartitionStateMachineKey;
 use restate_partition_store::keys::{DecodeTableKey, KeyKind};
+use restate_partition_store::stats::aggregated::{StageCounts, StageStatusCounts};
+use restate_partition_store::stats::{AggregateKeyPrefix, StatKind, StatValueCodec};
 use restate_partition_store::vqueue_table::{EntryStatusKey, InputPayloadKey};
+use restate_storage_api::blob_table::Header;
 use restate_storage_api::deduplication_table::DedupSequenceNumber;
-use restate_storage_api::fsm_table::{CachedEpochMetadata, PartitionDurability, SequenceNumber};
+use restate_storage_api::fsm_table::{
+    CachedEpochMetadata, FsmPosition, PartitionDurability, SequenceNumber,
+};
 use restate_storage_api::inbox_table::InboxEntry;
 use restate_storage_api::invocation_status_table::InvocationStatus;
 use restate_storage_api::journal_table::JournalEntry as JournalEntryV1;
@@ -61,6 +69,8 @@ mod fsm_variable {
     pub const SEAL_MARKER: u64 = 11;
     /// *Since v1.7.9*
     pub const STORAGE_FEATURES: u64 = 12;
+    /// *Since v1.8.2*
+    pub const FSM_POSITION: u64 = 13;
 }
 
 /// Result of decoding a value, including codec metadata
@@ -154,6 +164,13 @@ impl DecodedValue {
 /// - VQueue tables use bilrost encoding (no codec discriminant)
 /// - FSM table uses different types based on the state_id in the key
 pub fn decode_value(key_kind: KeyKind, key: &[u8], value: &[u8]) -> DecodedValue {
+    if key_kind == KeyKind::Stats {
+        return match AggregateKeyPrefix::decode(key) {
+            Ok((_, kind, _)) => decode_stat_value(kind, value),
+            Err(err) => DecodedValue::error(None, value.len(), err.to_string()),
+        };
+    }
+
     if value.is_empty() {
         return DecodedValue::empty();
     }
@@ -161,6 +178,9 @@ pub fn decode_value(key_kind: KeyKind, key: &[u8], value: &[u8]) -> DecodedValue
     match key_kind {
         // Raw bytes - user state, no decoding
         KeyKind::State | KeyKind::ScopedState => DecodedValue::raw_bytes(value.len()),
+
+        // Preserve nonempty index values as raw data.
+        KeyKind::SecondaryIndex => DecodedValue::raw_bytes(value.len()),
 
         // Key-only tables (VQueue active have empty values)
         KeyKind::VQueueActive => {
@@ -206,9 +226,45 @@ pub fn decode_value(key_kind: KeyKind, key: &[u8], value: &[u8]) -> DecodedValue
         KeyKind::ServiceStatus => decode_protobuf::<VirtualObjectStatus>(value),
         KeyKind::Timers => decode_protobuf::<Timer>(value),
         KeyKind::Promise | KeyKind::ScopedPromise => decode_protobuf::<Promise>(value),
+        KeyKind::Blob => decode_blob(key, value),
 
         // FSM table - decode based on state_id from key
         KeyKind::Fsm => decode_fsm_value(key, value),
+        // The registry, its walks and its jobs, by the record kind in the key.
+        KeyKind::Registry => decode_registry_record(key, value),
+        KeyKind::Stats => unreachable!("handled before empty-value decoding"),
+        #[allow(deprecated)]
+        KeyKind::LegacyStats => DecodedValue::decoded(
+            None,
+            value.len(),
+            format!("retired statistics value, {} bytes", value.len()),
+        ),
+    }
+}
+
+fn decode_stat_value(kind: StatKind, value: &[u8]) -> DecodedValue {
+    match kind {
+        StatKind::AggregatedGauge => match <u64 as StatValueCodec>::deserialize_from(value) {
+            Ok(value) => DecodedValue::decoded(None, size_of::<u64>(), format!("Gauge({value})")),
+            Err(_) => DecodedValue::error(
+                None,
+                value.len(),
+                format!("expected {} bytes for a gauge value", size_of::<u64>()),
+            ),
+        },
+        StatKind::StageBucketedGauge => decode_stage_counts(value),
+        StatKind::StageStatusBucketedGauge => match StageStatusCounts::deserialize_from(value) {
+            Ok(value) => DecodedValue::decoded(
+                None,
+                value.serialized_len(),
+                format!("StageStatusCounts({:?})", value.iter().collect::<Vec<_>>()),
+            ),
+            Err(_) => DecodedValue::error(
+                None,
+                value.len(),
+                "invalid stage/status-bucketed gauge value".to_owned(),
+            ),
+        },
     }
 }
 
@@ -330,6 +386,39 @@ fn decode_varint(data: &[u8]) -> Option<(usize, usize)> {
     }
 
     None
+}
+
+fn decode_blob(mut key: &[u8], value: &[u8]) -> DecodedValue {
+    if value.is_empty() {
+        return DecodedValue::empty();
+    }
+
+    let created_at = {
+        BlobKey::deserialize_from(&mut key)
+            .ok()
+            .map(|k| k.blob_id.timestamp().to_unix_millis())
+    };
+
+    match BlobHeader::decode(value) {
+        Ok((header, _body)) => {
+            let mut decoded = format!(
+                "Blob(Kind: {}, RefCount: {}",
+                header.kind(),
+                header.ref_count()
+            );
+            if let Some(ts) = created_at {
+                let _ = write!(
+                    decoded,
+                    ", CreatedAt: {} ({} ms)",
+                    ts.into_timestamp(),
+                    ts.as_u64()
+                );
+            }
+            decoded.push(')');
+            DecodedValue::decoded(None, value.len(), decoded)
+        }
+        Err(err) => DecodedValue::error(None, value.len(), format!("Blob error: {err}")),
+    }
 }
 
 /// Decode a protobuf value using PartitionStoreProtobufValue trait
@@ -459,6 +548,9 @@ fn decode_fsm_value(key: &[u8], value: &[u8]) -> DecodedValue {
         fsm_variable::STATE_MACHINE_FEATURES => {
             decode_fsm_storage_codec::<PersistedFeatures>(value, codec, payload_size)
         }
+        fsm_variable::FSM_POSITION => {
+            decode_fsm_storage_codec::<FsmPosition>(value, codec, payload_size)
+        }
         unknown => DecodedValue::decoded(
             codec,
             payload_size,
@@ -498,6 +590,184 @@ fn decode_fsm_storage_features(value: &[u8]) -> DecodedValue {
         }
         Err(err) => DecodedValue::error(None, payload_size, format!("{err}")),
     }
+}
+
+fn decode_stage_counts(value: &[u8]) -> DecodedValue {
+    match StageCounts::deserialize_from(value) {
+        Ok(value) => DecodedValue::decoded(
+            None,
+            value.serialized_len(),
+            format!("StageCounts({:?})", value.iter().collect::<Vec<_>>()),
+        ),
+        Err(_) => DecodedValue::error(
+            None,
+            value.len(),
+            "invalid stage-bucketed gauge value".to_owned(),
+        ),
+    }
+}
+
+/// Decodes a registry record (`KeyKind::Registry`): the registry, a walk or a
+/// migration job, by the record kind in its key, each stored as plain bilrost.
+/// A record this binary rejects, because a newer binary wrote it or it breaks
+/// an invariant, is still shown from its raw fields, next to the reason: that
+/// is when an operator needs to see it most.
+fn decode_registry_record(key: &[u8], value: &[u8]) -> DecodedValue {
+    use restate_partition_store::job::MigrationJob;
+    use restate_partition_store::registry::Registry;
+    use restate_partition_store::registry::records::{RecordKey, RecordKind};
+    use restate_partition_store::walk::Walk;
+
+    let payload_size = value.len();
+    let key = match RecordKey::decode(key) {
+        Ok(key) => key,
+        Err(err) => return DecodedValue::error(None, payload_size, format!("bad key: {err}")),
+    };
+    let id = key.id();
+    let shown = match key.record() {
+        RecordKind::Registry => decode_or_raw(value, Registry::decode, |registry: &Registry| {
+            format_registry(registry)
+        }),
+        RecordKind::Walk => decode_or_raw(value, |value| Walk::decode(id, value), format_walk),
+        RecordKind::Job => {
+            decode_or_raw(value, |value| MigrationJob::decode(id, value), format_job)
+        }
+    };
+    match shown {
+        Ok(text) => DecodedValue::decoded(None, payload_size, text),
+        Err(err) => DecodedValue::error(None, payload_size, err),
+    }
+}
+
+/// Shows the record `decode` accepts, or else its raw fields with the reason
+/// `decode` gave, or that reason alone if not even the raw fields decode.
+fn decode_or_raw<T: OwnedMessage, E: std::fmt::Display>(
+    value: &[u8],
+    decode: impl FnOnce(&[u8]) -> Result<T, E>,
+    format: impl FnOnce(&T) -> String,
+) -> Result<String, String> {
+    match decode(value) {
+        Ok(record) => Ok(format(&record)),
+        Err(reason) => match T::decode(value) {
+            Ok(record) => Ok(format!("{} rejected: {reason}", format(&record))),
+            Err(_) => Err(reason.to_string()),
+        },
+    }
+}
+
+fn format_registry(registry: &restate_partition_store::registry::Registry) -> String {
+    let entries = registry
+        .indexes()
+        .iter()
+        .map(|r| {
+            let walk = r
+                .walk
+                .map(|walk| format!(" walk={walk}"))
+                .unwrap_or_default();
+            let timeline = if r.timeline == Default::default() {
+                String::new()
+            } else {
+                format!(" {}", r.timeline)
+            };
+            format!(
+                "{} {} {:?} {:?}{walk}{timeline}",
+                r.id, r.definition, r.kind, r.state
+            )
+        })
+        .collect::<Vec<_>>();
+    let migrations = registry
+        .migrations()
+        .iter()
+        .map(|m| {
+            let state = m.state().map_or_else(
+                || format!("unknown({})", m.state),
+                |state| format!("{state:?}"),
+            );
+            let walk = m
+                .walk
+                .map(|walk| format!(" walk={walk}"))
+                .unwrap_or_default();
+            format!(
+                "{} {} {state} on_unknown={:?}{walk} {:?}",
+                m.id,
+                m.definition,
+                m.on_unknown(),
+                m.timeline
+            )
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "Registry(format={}, next_walk_id={}, [{}], migrations=[{}])",
+        registry.format(),
+        registry.next_walk_id(),
+        entries.join("; "),
+        migrations.join("; "),
+    )
+}
+
+fn format_walk(w: &restate_partition_store::walk::Walk) -> String {
+    let members = w
+        .members
+        .iter()
+        .map(|m| {
+            let joined = m
+                .joined_at
+                .as_deref()
+                .map_or_else(|| "start".to_owned(), super::hex_encode);
+            format!("{}(joined={joined} uncovered={})", m.index, m.uncovered)
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "Walk(id={} job={}/{} source={} on_unknown={:?} end={} cursor={} evidence=[{}])",
+        w.id,
+        w.kind.name,
+        w.kind.version,
+        w.source,
+        restate_partition_store::walk::OnUnknown::from_number(w.on_unknown),
+        super::hex_encode(&w.end),
+        w.cursor
+            .as_deref()
+            .map_or_else(|| "-".to_owned(), super::hex_encode),
+        members.join(", "),
+    )
+}
+
+fn format_job(j: &restate_partition_store::job::MigrationJob) -> String {
+    format!(
+        "MigrationJob(id={} {:?} {} {:?} walk={:?} created={:?} created_by={:?} started={:?} \
+         finished={:?} expires={:?} passes={} rows_examined={} rows_changed={} slices={} \
+         work_us={} last_slice={:?} last_slice_work_us={:?} failures={} \
+         consecutive_failures={} last_error={:?} last_error_at={:?} pass_started={:?} \
+         last_pass_finished={:?} rows_uncovered={:?} rows_uncovered_previous={:?} \
+         recheck_interval_ms={:?} next_eligible_at={:?})",
+        j.id(),
+        j.kind,
+        j.name,
+        j.status,
+        j.walk,
+        j.created_at,
+        j.created_by,
+        j.started_at,
+        j.finished_at,
+        j.expires_at,
+        j.passes,
+        j.rows_examined,
+        j.rows_changed,
+        j.slices,
+        j.work_us,
+        j.last_slice_at,
+        j.last_slice_work_us,
+        j.failures,
+        j.consecutive_failures,
+        j.last_error,
+        j.last_error_at,
+        j.pass_started_at,
+        j.last_pass_finished_at,
+        j.rows_uncovered,
+        j.rows_uncovered_previous,
+        j.recheck_interval_ms,
+        j.next_eligible_at,
+    )
 }
 
 /// Decode a SequenceNumber FSM value with a descriptive label
@@ -610,8 +880,10 @@ mod tests {
     use restate_partition_store::PaddedPartitionId;
     use restate_partition_store::fsm_table::PartitionStateMachineKey;
     use restate_partition_store::keys::EncodeTableKeyPrefix;
+    use restate_types::identifiers::PartitionId;
     use restate_types::logs::Lsn;
     use restate_types::storage::StorageCodec;
+    use zerocopy::IntoBytes;
 
     use super::*;
 
@@ -621,6 +893,84 @@ mod tests {
             state_id,
         }
         .serialize()
+    }
+
+    /// Registry records decode by the record kind in their key. One this binary
+    /// rejects, here a registry of a newer format or a job under another job's
+    /// key, is shown from its raw fields together with the reason.
+    #[test]
+    fn registry_records_decode_by_kind_and_rejected_ones_show_their_reason() {
+        use restate_partition_store::job::MigrationJobId;
+        use restate_partition_store::registry::Registry;
+        use restate_partition_store::registry::records::RecordKey;
+
+        let partition = PartitionId::MIN;
+        let decoded = decode_value(
+            KeyKind::Registry,
+            RecordKey::registry(partition).as_bytes(),
+            &Registry::default().encode(),
+        );
+        assert_eq!(decoded.codec, None);
+        assert_eq!(
+            decoded.to_string(),
+            "Registry(format=1, next_walk_id=1, [], migrations=[])"
+        );
+
+        /// The persisted registry's layout, with a format this binary does not support.
+        #[derive(bilrost::Message)]
+        struct NewerRegistry {
+            #[bilrost(1)]
+            format: u32,
+            #[bilrost(2)]
+            next_id: u64,
+        }
+        let value = bilrost::Message::encode_to_vec(&NewerRegistry {
+            format: 2,
+            next_id: 64,
+        });
+        let decoded = decode_value(
+            KeyKind::Registry,
+            RecordKey::registry(partition).as_bytes(),
+            &value,
+        );
+        let DecodedContent::Decoded(text) = &decoded.content else {
+            panic!("shown from its raw fields, got: {decoded}");
+        };
+        assert!(text.starts_with("Registry(format=2, "), "{text}");
+        assert!(
+            text.contains("rejected: unsupported registry format 2"),
+            "{text}"
+        );
+
+        // A job record: its fields, its expiry, and the key it must be under.
+        #[derive(bilrost::Message)]
+        struct Job {
+            #[bilrost(1)]
+            id: u32,
+            #[bilrost(27)]
+            expires_at: Option<u64>,
+        }
+        let job = bilrost::Message::encode_to_vec(&Job {
+            id: 64,
+            expires_at: Some(7),
+        });
+        let key = |id| RecordKey::job(partition, MigrationJobId::for_entry(id));
+        let decoded = decode_value(KeyKind::Registry, key(64).as_bytes(), &job);
+        let DecodedContent::Decoded(text) = &decoded.content else {
+            panic!("a job record, got: {decoded}");
+        };
+        assert!(text.starts_with("MigrationJob(id=64 ") && text.contains(" expires=Some(7) "));
+        let decoded = decode_value(KeyKind::Registry, key(65).as_bytes(), &job);
+        assert!(
+            decoded
+                .to_string()
+                .contains("rejected: invalid job record: the key of job 65 holds job 64"),
+            "{decoded}"
+        );
+        assert!(matches!(
+            decode_value(KeyKind::Registry, b"rg", &job).content,
+            DecodedContent::Error(_)
+        ));
     }
 
     /// The newer FSM variables (>= v1.6) must decode through their dedicated arms
@@ -699,5 +1049,55 @@ mod tests {
             matches!(&decoded.content, DecodedContent::Decoded(s) if s.contains("future-feature")),
             "storage features should preserve unknown names, got: {decoded}"
         );
+
+        // FSM position: a StorageCodec-encoded message
+        let mut position = FsmPosition::new(Lsn::new(1));
+        position.start_byte_offsets(Lsn::new(2));
+        position.advance(Lsn::new(3), 30);
+        let mut value = BytesMut::new();
+        StorageCodec::encode(&position, &mut value).unwrap();
+        let decoded = decode_value(KeyKind::Fsm, &fsm_key(fsm_variable::FSM_POSITION), &value);
+        assert!(
+            matches!(&decoded.content, DecodedContent::Decoded(s) if s.contains("log_byte_offset: 30")),
+            "fsm position should decode, got: {decoded}"
+        );
+    }
+
+    #[test]
+    fn decodes_bucketed_gauge_values() {
+        use restate_storage_api::vqueue_table::{Stage, Status};
+
+        let mut key = AggregateKeyPrefix::new(PartitionId::from(7), 70)
+            .as_bytes()
+            .to_vec();
+        key.push(StatKind::StageStatusBucketedGauge as u8);
+        key.extend_from_slice(b"payload");
+
+        let mut value = vec![Stage::Inbox as u8, Status::New as u8];
+        value.extend_from_slice(&42_u64.to_be_bytes());
+        let decoded = decode_value(KeyKind::Stats, &key, &value);
+        assert_eq!(decoded.codec, None);
+        assert_eq!(decoded.payload_size, 2 + size_of::<u64>());
+        assert!(
+            matches!(decoded.content, DecodedContent::Decoded(value) if value.contains("Inbox") && value.contains("New") && value.contains("42"))
+        );
+
+        let decoded = decode_value(KeyKind::Stats, &key, &[0; 7]);
+        assert!(
+            matches!(decoded.content, DecodedContent::Error(error) if error.contains("invalid stage/status-bucketed"))
+        );
+
+        let decoded = decode_value(KeyKind::Stats, &key, &[]);
+        assert!(
+            matches!(decoded.content, DecodedContent::Decoded(value) if value == "StageStatusCounts([])")
+        );
+
+        // A key without its aggregation kind cannot select a value codec.
+        let decoded = decode_value(
+            KeyKind::Stats,
+            &key[..AggregateKeyPrefix::SERIALIZED_LENGTH],
+            &value,
+        );
+        assert!(matches!(decoded.content, DecodedContent::Error(_)));
     }
 }

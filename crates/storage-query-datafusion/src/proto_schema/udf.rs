@@ -28,7 +28,7 @@ use restate_types::schema::service::ServiceMetadataResolver;
 
 use super::DynamicProtoSchemaRegistry;
 use super::wire::{extract_bool, extract_f64, extract_i64, extract_str, transcode_to_json};
-use crate::context::QueryContext;
+use crate::TableInventoryBuilder;
 type ResolvedPath = Option<(Arc<super::ServiceProtoSchemas>, Arc<Vec<super::PathStep>>)>;
 type ResolvedMsgSchema = Option<(
     Arc<super::ServiceProtoSchemas>,
@@ -36,11 +36,10 @@ type ResolvedMsgSchema = Option<(
 )>;
 
 pub fn register_udfs<SMR: ServiceMetadataResolver + Send + Sync + Clone + 'static>(
-    ctx: &QueryContext,
+    inventory: &mut TableInventoryBuilder<'_>,
     registry: DynamicProtoSchemaRegistry<SMR>,
 ) {
-    let session = ctx.as_ref();
-    session.register_udf(make_typed_getter_udf(
+    inventory.add_udf(make_typed_getter_udf(
         "proto_get_str",
         DataType::LargeUtf8,
         registry.clone(),
@@ -50,7 +49,7 @@ pub fn register_udfs<SMR: ServiceMetadataResolver + Send + Sync + Clone + 'stati
             None => b.append_null(),
         },
     ));
-    session.register_udf(make_typed_getter_udf(
+    inventory.add_udf(make_typed_getter_udf(
         "proto_get_int",
         DataType::Int64,
         registry.clone(),
@@ -59,7 +58,7 @@ pub fn register_udfs<SMR: ServiceMetadataResolver + Send + Sync + Clone + 'stati
             b.append_option(row.and_then(|(bytes, steps, pool)| extract_i64(bytes, steps, pool)))
         },
     ));
-    session.register_udf(make_typed_getter_udf(
+    inventory.add_udf(make_typed_getter_udf(
         "proto_get_float",
         DataType::Float64,
         registry.clone(),
@@ -68,7 +67,7 @@ pub fn register_udfs<SMR: ServiceMetadataResolver + Send + Sync + Clone + 'stati
             b.append_option(row.and_then(|(bytes, steps, pool)| extract_f64(bytes, steps, pool)))
         },
     ));
-    session.register_udf(make_typed_getter_udf(
+    inventory.add_udf(make_typed_getter_udf(
         "proto_get_bool",
         DataType::Boolean,
         registry.clone(),
@@ -77,7 +76,7 @@ pub fn register_udfs<SMR: ServiceMetadataResolver + Send + Sync + Clone + 'stati
             b.append_option(row.and_then(|(bytes, steps, pool)| extract_bool(bytes, steps, pool)))
         },
     ));
-    session.register_udf(make_proto_to_json_udf(registry));
+    inventory.add_udf(make_proto_to_json_udf(registry));
 }
 
 #[inline]

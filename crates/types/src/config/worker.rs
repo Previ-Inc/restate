@@ -22,7 +22,7 @@ use restate_util_time::{FriendlyDuration, NonZeroFriendlyDuration};
 
 use super::{
     BackgroundWorkBudget, CommonOptions, DEFAULT_MESSAGE_SIZE_LIMIT, NetworkingOptions,
-    ObjectStoreOptions, RocksDbOptions, SelfProposerCongestionControl,
+    ObjectStoreOptions, RocksDbCompaction, RocksDbOptions, SelfProposerCongestionControl,
 };
 use crate::config::throttling::ThrottlingOptions;
 use crate::config::{
@@ -32,6 +32,13 @@ use crate::config::{
 use crate::identifiers::PartitionId;
 use crate::net::connect_opts::MESSAGE_SIZE_OVERHEAD;
 use crate::retries::RetryPolicy;
+
+/// Object stores require parts of a multipart upload to be at least this large, except the last.
+const MIN_MULTIPART_UPLOAD_PART_SIZE: usize = 5 * 1024 * 1024;
+/// Default part size for snapshot uploads.
+const DEFAULT_UPLOAD_PART_SIZE: usize = 32 * 1024 * 1024;
+/// The largest object that S3 accepts in a single PUT request.
+const MAX_OBJECT_STORE_SINGLE_PUT_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 
 const MIN_ROCKSDB_MEMORY: NonZeroByteCount =
     NonZeroByteCount::new(NonZeroUsize::new(32 * 1024 * 1024).unwrap());
@@ -107,9 +114,15 @@ pub struct WorkerOptions {
 
     /// # Maximum command batch size (in bytes) for partition processors
     ///
-    /// Caps the total bytes of Bifrost log records processed opportunistically by the partition processor in
-    /// a single iteration. This works in conjunction with `max-command-batch-size` which caps the
-    /// number of records. The processor will process the batch when whichever limit is hit first.
+    /// Caps the size of the write batch a partition processor commits to its partition store for
+    /// the Bifrost log records it processes opportunistically in a single iteration. Applying a
+    /// record usually writes more than the record's own size. A batch can exceed this limit by
+    /// what its last record writes beyond its own size, or when a single record writes more than
+    /// the limit. This works in conjunction with `max-command-batch-size` which caps the number of
+    /// records. The processor will process the batch when whichever limit is hit first.
+    ///
+    /// Background migrations, such as backfilling query indexes and statistics, keep the writes of
+    /// each slice within the same budget (see `worker.storage.background-migrations-max-slice-entries`).
     ///
     /// Default: 1 MiB
     ///
@@ -243,6 +256,23 @@ pub struct WorkerOptions {
         skip_serializing_if = "serde_helpers::is_vqueue_metadata_cache_default"
     )]
     vqueue_metadata_cache_size: u32,
+
+    /// # Inline journal entry threshold
+    ///
+    /// On partition stores that enabled `experimental-enable-write-blob-table`, journal entries
+    /// up to this size are stored inline. Larger ones are stored separately. Set to `0` to always
+    /// store them separately.
+    ///
+    /// Changes take effect after a restart.
+    ///
+    /// Default: 4 KiB
+    ///
+    /// Since v1.8.2
+    #[serde(
+        default = "serde_helpers::inline_journal_entry_threshold_default",
+        skip_serializing_if = "serde_helpers::is_inline_journal_entry_threshold_default"
+    )]
+    pub inline_journal_entry_threshold: ByteCount,
 }
 
 impl WorkerOptions {
@@ -326,6 +356,7 @@ impl Default for WorkerOptions {
             ),
             vqueue_metadata_cache_size: serde_helpers::vqueue_metadata_cache_size_default(),
             self_proposer_congestion_control: SelfProposerCongestionControl::default(),
+            inline_journal_entry_threshold: serde_helpers::inline_journal_entry_threshold_default(),
         }
     }
 }
@@ -1044,12 +1075,39 @@ pub struct StorageOptions {
 
     /// # Number of L0 files to trigger compaction
     ///
-    /// Sets the number of files to trigger level-0 compaction.
+    /// Sets the number of files to trigger level-0 compaction. Applies to leveled compaction only;
+    /// see `rocksdb-compaction`.
     ///
     /// [default] is 2
     ///
     /// Since v1.7.7
     pub rocksdb_l0_num_compaction_trigger: NonZeroU32,
+
+    /// # Compaction
+    ///
+    /// How RocksDB compacts the partition stores: `style = "level"` (default) or
+    /// `style = "universal"`, which also takes `sorted-runs-compaction-trigger` and
+    /// `max-size-amplification-percent`.
+    ///
+    /// Universal compaction rewrites data far less often than leveled compaction, which saves disk
+    /// bandwidth and CPU, at the cost of disk space. With the default
+    /// `max-size-amplification-percent` of 100, a partition store grows to up to about twice its
+    /// live data before its sorted runs are merged into one. The merge writes a new copy of the
+    /// live data before it deletes the old files, so the partition store briefly takes up to about
+    /// three times its live data. Each partition store is merged on its own, but partition stores
+    /// that grow at the same pace merge at about the same time.
+    ///
+    /// ```toml
+    /// [worker.storage.rocksdb-compaction]
+    /// style = "universal"
+    /// max-size-amplification-percent = 100
+    /// ```
+    ///
+    /// Switching styles needs no migration. Takes effect on restart.
+    ///
+    /// Since v1.8.2
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rocksdb_compaction: Option<RocksDbCompaction>,
 
     /// # Max open files
     ///
@@ -1094,6 +1152,72 @@ pub struct StorageOptions {
         skip_serializing_if = "serde_helpers::is_default_vqueue_meta_full_write_probability"
     )]
     pub vqueue_meta_full_write_probability: f64,
+
+    /// # Disable background migrations
+    ///
+    /// Stops partitions from running background migrations while they process commands,
+    /// such as backfilling query indexes and statistics. Pending migrations then wait,
+    /// while the partition keeps maintaining its indexes and statistics for the entries
+    /// written from then on; indexes and statistics that are already complete stay
+    /// complete.
+    ///
+    /// Takes effect when partition processors start.
+    ///
+    /// Since v1.8.2
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub disable_background_migrations: bool,
+
+    /// # Background migrations throttling
+    ///
+    /// Token-bucket limit on the entries that background migrations examine on each
+    /// partition replica, one token per entry. After a pause, they may examine up to the
+    /// burst capacity at once. Unset by default: background migrations already yield to
+    /// the partition's commands, and this limit further caps their I/O and CPU use. A
+    /// lower rate makes them take correspondingly longer.
+    ///
+    /// Takes effect when partition processors start.
+    ///
+    /// Since v1.8.2
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub background_migrations_throttling: Option<ThrottlingOptions>,
+
+    /// # Background migration slice entries
+    ///
+    /// The most existing entries one slice of a background migration processes. Background
+    /// migrations, such as backfilling query indexes and statistics, run in slices between the
+    /// partition's commands, and the commands wait while a slice runs. Slices aim at about 2 ms
+    /// each: the number of entries they aim at adapts to how long entries take, between 16 (or
+    /// this limit, if lower) and this limit. A lower limit keeps slices shorter; a higher one lets
+    /// fast entries go in fewer, larger slices.
+    ///
+    /// A slice can process fewer entries: its writes stay within `worker.max-command-batch-bytes`,
+    /// the budget of a batch of commands, though its first entry always goes in, however large.
+    ///
+    /// Takes effect when partition processors start.
+    ///
+    /// Since v1.8.2
+    #[serde(
+        default = "serde_helpers::default_background_migrations_max_slice_entries",
+        skip_serializing_if = "serde_helpers::is_default_background_migrations_max_slice_entries"
+    )]
+    pub background_migrations_max_slice_entries: NonZeroUsize,
+
+    /// # Finished migration jobs retention
+    ///
+    /// How long each partition replica keeps the record of a finished background
+    /// migration, such as an index or statistic build, for inspection. A record
+    /// expires this long after its migration finished, with the retention
+    /// configured then, and is then no longer shown and later deleted. Unfinished
+    /// migrations are always recorded. `0` keeps no finished migrations.
+    ///
+    /// Takes effect when partitions open.
+    ///
+    /// Since v1.8.2
+    #[serde(
+        default = "serde_helpers::default_finished_migration_jobs_retention",
+        skip_serializing_if = "serde_helpers::is_default_finished_migration_jobs_retention"
+    )]
+    pub finished_migration_jobs_retention: FriendlyDuration,
 }
 
 impl StorageOptions {
@@ -1148,6 +1272,12 @@ impl StorageOptions {
             })
     }
 
+    /// The configured compaction, leveled if unset. A node reads it once, when it starts: a change
+    /// takes a restart.
+    pub fn rocksdb_compaction(&self) -> RocksDbCompaction {
+        self.rocksdb_compaction.unwrap_or_default()
+    }
+
     pub fn set_rocksdb_memory_budget(&mut self, budget: NonZeroByteCount) {
         self.rocksdb_memory_budget = Some(budget);
     }
@@ -1190,10 +1320,17 @@ impl Default for StorageOptions {
                 NonZeroUsize::new(1024 * 1024).unwrap(),
             ),
             rocksdb_l0_num_compaction_trigger: NonZeroU32::new(2).unwrap(),
+            rocksdb_compaction: None,
             rocksdb_max_open_files: None,
             rocksdb_max_successive_merges: DEFAULT_MAX_SUCCESSIVE_MERGES,
             vqueue_meta_full_write_probability:
                 serde_helpers::default_vqueue_meta_full_write_probability(),
+            disable_background_migrations: false,
+            background_migrations_throttling: None,
+            background_migrations_max_slice_entries:
+                serde_helpers::default_background_migrations_max_slice_entries(),
+            finished_migration_jobs_retention:
+                serde_helpers::default_finished_migration_jobs_retention(),
         }
     }
 }
@@ -1330,6 +1467,44 @@ pub struct SnapshotsOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub automatic_snapshot_concurrency_limit: Option<NonZeroU32>,
 
+    /// # Snapshot upload part size
+    ///
+    /// Size of each part when uploading a snapshot file to the object store in multiple parts.
+    /// Every part, and the create and complete calls of each multipart upload, is a separate
+    /// object store request, so larger parts mean fewer requests. For files that would need more
+    /// than 10,000 parts, a larger part size is used automatically.
+    ///
+    /// Must be at least 5 MiB. One part at a time is buffered in memory for each file upload
+    /// in progress.
+    ///
+    /// Default: 32 MiB
+    ///
+    /// Changes take effect after a restart.
+    ///
+    /// Since v1.8.2
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_part_size: Option<NonZeroByteCount>,
+
+    /// # Snapshot single PUT threshold
+    ///
+    /// Snapshot files smaller than this are uploaded with a single object store request instead
+    /// of a multipart upload. Raising it reduces the number of requests for mid-sized files.
+    ///
+    /// Such a file is read into memory in full, so the worst-case memory use is this value times
+    /// the number of uploads in progress. That is at most `automatic-snapshot-concurrency-limit`
+    /// automatic snapshots, plus any requested with `restatectl`, each uploading one file at a
+    /// time. Values up to 256 MiB are recommended.
+    ///
+    /// Must be at least `upload-part-size`, and at most 5 GiB.
+    ///
+    /// Default: the value of `upload-part-size`
+    ///
+    /// Changes take effect after a restart.
+    ///
+    /// Since v1.8.2
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_single_put_threshold: Option<NonZeroByteCount>,
+
     #[cfg(any(test, feature = "test-util"))]
     pub enable_cleanup: bool,
 }
@@ -1366,6 +1541,8 @@ impl Default for SnapshotsOptions {
             num_retained: default_num_retained(),
             export_concurrency_limit: None,
             automatic_snapshot_concurrency_limit: None,
+            upload_part_size: None,
+            upload_single_put_threshold: None,
             #[cfg(any(test, feature = "test-util"))]
             enable_cleanup: true,
         }
@@ -1390,6 +1567,48 @@ impl SnapshotsOptions {
         self.automatic_snapshot_concurrency_limit
             .map(|v| v.get())
             .unwrap_or(4)
+    }
+
+    /// Part size for multipart uploads, in bytes.
+    pub fn upload_part_size(&self) -> usize {
+        self.upload_part_size
+            .map_or(DEFAULT_UPLOAD_PART_SIZE, |v| v.as_usize())
+    }
+
+    /// Files smaller than this many bytes are uploaded with a single request.
+    pub fn upload_single_put_threshold(&self) -> u64 {
+        self.upload_single_put_threshold
+            .map_or_else(|| self.upload_part_size() as u64, |v| v.as_u64())
+    }
+
+    /// Checks the object store upload sizes against the limits of S3-compatible stores.
+    pub fn validate_upload_sizes(&self) -> Result<(), String> {
+        let (part_size, threshold) = (
+            self.upload_part_size() as u64,
+            self.upload_single_put_threshold(),
+        );
+        if part_size < MIN_MULTIPART_UPLOAD_PART_SIZE as u64 {
+            return Err(format!(
+                "upload-part-size ({}) must be at least {}",
+                ByteCount::from(part_size),
+                ByteCount::from(MIN_MULTIPART_UPLOAD_PART_SIZE),
+            ));
+        }
+        if threshold < part_size {
+            return Err(format!(
+                "upload-single-put-threshold ({}) must be at least upload-part-size ({})",
+                ByteCount::from(threshold),
+                ByteCount::from(part_size),
+            ));
+        }
+        if threshold > MAX_OBJECT_STORE_SINGLE_PUT_SIZE {
+            return Err(format!(
+                "upload-single-put-threshold ({}) must be at most {}",
+                ByteCount::from(threshold),
+                ByteCount::from(MAX_OBJECT_STORE_SINGLE_PUT_SIZE),
+            ));
+        }
+        Ok(())
     }
 
     /// Returns the effective automatic snapshot triggers, or `None` if automatic snapshots are
@@ -1419,6 +1638,15 @@ mod serde_helpers {
     use std::num::{NonZeroU32, NonZeroUsize};
 
     use restate_util_bytecount::ByteCount;
+    use restate_util_time::FriendlyDuration;
+
+    pub const fn inline_journal_entry_threshold_default() -> ByteCount {
+        ByteCount::<true>::new(4 * 1024)
+    }
+
+    pub fn is_inline_journal_entry_threshold_default(value: &ByteCount) -> bool {
+        *value == inline_journal_entry_threshold_default()
+    }
 
     pub const fn cleanup_max_in_flight_purges_default() -> NonZeroU32 {
         NonZeroU32::new(32).unwrap()
@@ -1470,6 +1698,22 @@ mod serde_helpers {
         *v == default_compact_on_deletions_min_sst_file_size()
     }
 
+    pub const fn default_finished_migration_jobs_retention() -> FriendlyDuration {
+        FriendlyDuration::from_secs(24 * 60 * 60)
+    }
+
+    pub fn is_default_finished_migration_jobs_retention(v: &FriendlyDuration) -> bool {
+        *v == default_finished_migration_jobs_retention()
+    }
+
+    pub const fn default_background_migrations_max_slice_entries() -> NonZeroUsize {
+        NonZeroUsize::new(1000).unwrap()
+    }
+
+    pub fn is_default_background_migrations_max_slice_entries(v: &NonZeroUsize) -> bool {
+        *v == default_background_migrations_max_slice_entries()
+    }
+
     pub const fn default_vqueue_meta_full_write_probability() -> f64 {
         1.0
     }
@@ -1495,6 +1739,26 @@ mod tests {
 
         let options: WorkerOptions = serde_json::from_value(value).unwrap();
         assert!(options.disable_scheduler);
+    }
+
+    #[test]
+    fn background_migration_slices_take_at_most_a_thousand_entries_by_default() {
+        let options = StorageOptions::default();
+        assert_eq!(1000, options.background_migrations_max_slice_entries.get());
+
+        let mut value = serde_json::to_value(options).unwrap();
+        assert!(
+            value
+                .get("background-migrations-max-slice-entries")
+                .is_none(),
+            "the default isn't written out"
+        );
+        value["background-migrations-max-slice-entries"] = 200.into();
+        let options: StorageOptions = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(200, options.background_migrations_max_slice_entries.get());
+
+        value["background-migrations-max-slice-entries"] = 0.into();
+        assert!(serde_json::from_value::<StorageOptions>(value).is_err());
     }
 
     #[test]
@@ -1551,6 +1815,39 @@ mod tests {
         let mut value = serde_json::to_value(SnapshotsOptions::default()).unwrap();
         value["automatic-snapshot-concurrency-limit"] = 0.into();
         assert!(serde_json::from_value::<SnapshotsOptions>(value).is_err());
+    }
+
+    #[test]
+    fn snapshot_upload_sizes_validation() {
+        const MIB: u64 = 1024 * 1024;
+        let validate = |part_size: u64, threshold: u64| {
+            SnapshotsOptions {
+                upload_part_size: NonZeroByteCount::try_from(part_size).ok(),
+                upload_single_put_threshold: NonZeroByteCount::try_from(threshold).ok(),
+                ..Default::default()
+            }
+            .validate_upload_sizes()
+        };
+
+        // The threshold follows the part size by default
+        let defaults = SnapshotsOptions::default();
+        assert_eq!(32 * MIB as usize, defaults.upload_part_size());
+        assert_eq!(32 * MIB, defaults.upload_single_put_threshold());
+        assert!(defaults.validate_upload_sizes().is_ok());
+
+        // Setting only the part size raises the threshold with it
+        let part_size_only = SnapshotsOptions {
+            upload_part_size: NonZeroByteCount::try_from(32 * MIB).ok(),
+            ..Default::default()
+        };
+        assert_eq!(32 * MIB, part_size_only.upload_single_put_threshold());
+        assert!(part_size_only.validate_upload_sizes().is_ok());
+
+        assert!(validate(32 * MIB, 128 * MIB).is_ok());
+        assert!(validate(5 * MIB, 5 * MIB).is_ok());
+        assert!(validate(5 * MIB - 1, 128 * MIB).is_err());
+        assert!(validate(32 * MIB, 16 * MIB).is_err());
+        assert!(validate(32 * MIB, 5 * 1024 * MIB + 1).is_err());
     }
 
     #[test]

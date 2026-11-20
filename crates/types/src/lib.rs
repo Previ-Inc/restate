@@ -26,6 +26,7 @@ pub mod cluster;
 pub mod cluster_state;
 pub mod health;
 
+pub mod blob;
 pub mod cluster_marker;
 pub mod config;
 pub mod config_loader;
@@ -182,6 +183,12 @@ impl std::borrow::Borrow<str> for ServiceName {
 impl From<&str> for ServiceName {
     fn from(value: &str) -> Self {
         ServiceName::new(value)
+    }
+}
+
+impl From<ServiceName> for ReString {
+    fn from(value: ServiceName) -> Self {
+        value.0.into_restring()
     }
 }
 

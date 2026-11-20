@@ -466,6 +466,12 @@ fn key_kind_abbrev(kind: restate_partition_store::keys::KeyKind) -> &'static str
         KeyKind::VQueueEntryStatus => "Status",
         KeyKind::VQueueInput => "VQItm",
         KeyKind::Lock => "Locks",
+        KeyKind::Blob => "Blob",
+        KeyKind::Stats => "Stats",
+        #[allow(deprecated)]
+        KeyKind::LegacyStats => "LegacyStats",
+        KeyKind::SecondaryIndex => "Index",
+        KeyKind::Registry => "Registry",
     }
 }
 

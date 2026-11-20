@@ -10,17 +10,17 @@
 
 mod admin_client;
 mod admin_interface;
-#[cfg(feature = "cloud")]
 pub mod cloud;
 pub mod datafusion_helpers;
 mod datafusion_http_client;
 mod errors;
+pub mod github;
 
 pub use self::admin_client::AdminClient;
 pub use self::admin_client::{MAX_ADMIN_API_VERSION, MIN_ADMIN_API_VERSION};
 pub use self::admin_interface::Deployment;
 pub use self::admin_interface::{AdminClientInterface, batch_execute};
-pub use self::datafusion_http_client::DataFusionHttpClient;
+pub use self::datafusion_http_client::{DataFusionHttpClient, QueryEngine};
 #[cfg(test)]
 pub(crate) use self::errors::ApiErrorBody;
 pub use self::errors::{ApiError, ClientError, error_docs_url};

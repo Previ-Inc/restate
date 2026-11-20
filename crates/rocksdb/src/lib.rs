@@ -41,7 +41,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 use restate_core::ShutdownError;
-use restate_core::io::{AdmissionClosed, Gate, IoExecutor, Lease, OwnedLease, TrackedTask};
+use restate_core::io::{AdmissionClosed, Gate, IoExecutor, Lease, OwnedLease};
 use restate_futures_util::overdue::OverdueLoggingExt;
 use restate_types::protobuf::common::DatabaseKind;
 pub use restate_types::rocksdb::{BottommostLevelCompaction, ManualCompactionOptions};
@@ -49,8 +49,9 @@ use restate_util_lifecycle::Scope;
 
 // re-exports
 pub use self::background::{
-    GlobalExecutor, Guarded, Mapped, MappedOk, OpContext, OpFn, Priority, SinglePoolExecutor,
-    StorageOp, StorageTaskKind,
+    Admission, Async, CachedOpFn, Cancellable, CancellableAsync, Cooperative, Gated,
+    GlobalExecutor, Guarded, Inline, Mapped, MappedOk, OpContext, OpFn, Priority, ReadPerf,
+    SinglePoolExecutor, StorageOp, StorageTaskKind, SyncOpFn, Ungated,
 };
 pub use self::cf_handles::CfHandles;
 pub use self::db_env::DbEnv;
@@ -59,7 +60,9 @@ pub use self::db_spec::*;
 pub use self::error::*;
 pub use self::iterator::IterAction;
 use self::iterator::RocksIterator;
-pub use self::perf::{RocksDbReadPerfGuard, RocksDbWritePerfGuard};
+pub use self::perf::{
+    RocksDbPerf, RocksDbPerfExt, RocksDbPerfStreamExt, RocksDbReadPerfGuard, RocksDbWritePerfGuard,
+};
 use self::reads::ColumnFamilies;
 pub use self::rock_access::RocksAccess;
 pub use restate_util_lifecycle::KeepAlive;
@@ -85,12 +88,17 @@ type BoxedCfMatcher = Box<dyn CfNameMatch + Send + Sync>;
 /// # Ok(())
 /// # }
 /// ```
-pub type DatabaseOp<'a, F> = StorageOp<'a, &'a Arc<RocksDb>, F>;
+pub type DatabaseOp<'a, F> = StorageOp<&'a Arc<RocksDb>, F, Gated<'a>>;
+
+/// An operation on a scope of a database, prepared with
+/// [`RocksDb::prepare_flush`] or [`RocksDb::prepare_export_cf`]. Its context is
+/// the scope, borrowed for `'s`, and it counts in a gate borrowed for `'g`.
+pub type ScopeOp<'g, 's, C, F> = StorageOp<&'s Scope<C>, F, Gated<'g>>;
 
 /// Defines how to perform a potentially blocking rocksdb IO operation.
 #[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
 pub enum IoMode {
-    /// [Dangerous] Allow blocking IO operation to happen in the worker thread (tokio)
+    /// **Dangerous:** Allow blocking IO operation to happen in the worker thread (tokio)
     AllowBlockingIO,
     /// Fail the operation if operation needs to block on IO
     OnlyIfNonBlocking,
@@ -611,7 +619,7 @@ impl RocksDb {
     /// Prepares an operation on this database without running it yet.
     ///
     /// Run it on the current thread with
-    /// [`IoOp::call`](restate_core::io::IoOp::call), or submit it to any
+    /// [`StorageOp::call`](crate::StorageOp::call), or submit it to any
     /// [`IoExecutor`], such as one of [`Self::executor`]'s pools, to run it on a
     /// background thread. Admission is checked at that point, not now: a prepared
     /// operation doesn't delay [`Self::drain`], and if the database is sealed first,
@@ -629,7 +637,7 @@ impl RocksDb {
         self: &Arc<Self>,
         kind: StorageTaskKind,
         op: F,
-    ) -> StorageOp<'_, &Arc<Self>, F>
+    ) -> StorageOp<&Arc<Self>, F, Gated<'_>>
     where
         F: FnOnce(&Arc<Self>) -> R + Send + 'static,
     {
@@ -647,7 +655,7 @@ impl RocksDb {
         gate: &'a Arc<Gate>,
         kind: StorageTaskKind,
         op: F,
-    ) -> StorageOp<'a, &'b Arc<Self>, F>
+    ) -> StorageOp<&'b Arc<Self>, F, Gated<'a>>
     where
         F: FnOnce(&Arc<Self>) -> R + Send + 'static,
     {
@@ -662,21 +670,28 @@ impl RocksDb {
     pub fn prepare_drop_cf(
         self: Arc<Self>,
         name: CfName,
-    ) -> StorageOp<'static, (), impl FnOnce() -> Result<(), RocksError> + Send + 'static> {
+    ) -> StorageOp<(), impl FnOnce() -> Result<(), RocksError> + Send + 'static, Ungated> {
         let lease = self
             .registration
             .as_ref()
             .map(|r| r.manager.track_lifecycle());
-        let task = TrackedTask::new(
+        let drop_cf = move || {
+            self.db
+                .as_raw_db()
+                .drop_cf(name.as_str())
+                .map_err(RocksError::from)
+        };
+        // Tuple fields drop in order, so the database is released before the lease,
+        // even if the task is dropped without running. `{ task }` makes the closure
+        // capture the tuple whole, rather than its fields one by one.
+        let task = (drop_cf, lease);
+        StorageOp::without_admission(
             move || {
-                self.db
-                    .as_raw_db()
-                    .drop_cf(name.as_str())
-                    .map_err(RocksError::from)
+                let (drop_cf, _lease) = { task };
+                drop_cf()
             },
-            lease,
-        );
-        StorageOp::without_admission(move || task.run(), StorageTaskKind::DropColumnFamily)
+            StorageTaskKind::DropColumnFamily,
+        )
     }
 
     /// Prepares flushing the memtables of all of `scope`'s column families, to
@@ -696,9 +711,10 @@ impl RocksDb {
         scope: &'c Scope<C>,
         gate: &'a Arc<Gate>,
         wait: bool,
-    ) -> StorageOp<
+    ) -> ScopeOp<
         'a,
-        &'c Scope<C>,
+        'c,
+        C,
         impl FnOnce(&Scope<C>) -> Result<(), RocksError> + Send + 'static + use<C>,
     > {
         scope
@@ -739,9 +755,10 @@ impl RocksDb {
         gate: &'a Arc<Gate>,
         cf: C::Cf,
         export_dir: PathBuf,
-    ) -> StorageOp<
+    ) -> ScopeOp<
         'a,
-        &'c Scope<C>,
+        'c,
+        C,
         impl FnOnce(&Scope<C>) -> Result<ExportImportFilesMetaData, RocksError>
         + Send
         + 'static

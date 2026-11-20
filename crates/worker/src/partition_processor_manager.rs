@@ -33,7 +33,7 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
-use tracing::{debug, error, info, info_span, instrument, trace, warn};
+use tracing::{debug, error, field, info, info_span, instrument, trace, warn};
 
 use restate_bifrost::Bifrost;
 use restate_bifrost::loglet::FindTailOptions;
@@ -48,14 +48,14 @@ use restate_core::{
 };
 use restate_core::{RuntimeTaskHandle, TaskCenter};
 use restate_ingestion_client::IngestionClient;
+use restate_memory::ByteCount;
 use restate_metadata_server::{MetadataStoreClient, ReadModifyWriteError};
 use restate_metadata_store::{ReadWriteError, RetryError, retry_on_retryable_error};
-use restate_partition_store::PartitionStoreManager;
 use restate_partition_store::snapshots::{
     PartitionSnapshotStatus, SnapshotPartitionTask, SnapshotRepository, remove_leftover_exports,
 };
+use restate_partition_store::{DroppedPartitionStore, PartitionStoreManager};
 use restate_partition_store::{SnapshotError, SnapshotErrorKind};
-use restate_types::GenerationalNodeId;
 use restate_types::cluster::cluster_state::ReplayStatus;
 use restate_types::cluster::cluster_state::{BrokenReason, PartitionProcessorStatus, RunMode};
 use restate_types::config::{AutomaticSnapshots, Configuration};
@@ -80,11 +80,12 @@ use restate_types::partition_table::PartitionTable;
 use restate_types::partitions::Partition;
 use restate_types::partitions::state::PartitionReplicaSetStates;
 use restate_types::protobuf::common::WorkerStatus;
+use restate_types::{GenerationalNodeId, Version};
 use restate_util_string::format_restring;
 use restate_util_time::DurationExt;
 use restate_wal_protocol::v2::{Envelope, Raw};
 use restate_worker_api::invoker::capacity::InvokerCapacity;
-use restate_worker_api::{ProcessorsManagerCommand, ProcessorsManagerHandle};
+use restate_worker_api::{PartitionReadError, ProcessorsManagerCommand, ProcessorsManagerHandle};
 
 use crate::metric_definitions::{
     ERROR_STOP, FLARE_REASON_AHEAD_OF_LOG, FLARE_REASON_MIGRATION_BARRIER,
@@ -152,6 +153,21 @@ struct PendingSnapshotTask {
 
 type DropResult = Result<DropPartitionStoreOutcome, DropPartitionStoreError>;
 
+/// How long a drop request without `force` waits for this node to learn about the partition
+/// configuration that the requester saw.
+const DROP_PARTITION_STORE_CONFIGURATION_WAIT: Duration = Duration::from_secs(5);
+
+/// An operator's request to drop this node's local copy of a partition, see
+/// [`DropPartitionStoreRequest`].
+struct DropRequest {
+    force: bool,
+    /// Only report what would be dropped, without changing anything.
+    dry_run: bool,
+    min_partition_configuration_version: Version,
+    reason: String,
+    sender: oneshot::Sender<DropResult>,
+}
+
 /// An in-flight request to delete this node's local copy of a partition.
 ///
 /// While one of these exists for a partition, the manager will not start a processor for it,
@@ -159,6 +175,7 @@ type DropResult = Result<DropPartitionStoreOutcome, DropPartitionStoreError>;
 struct PendingDrop {
     /// Set while we are waiting for a running processor to terminate before we can drop.
     awaiting_stop: bool,
+    reason: String,
     sender: oneshot::Sender<DropResult>,
 }
 
@@ -302,16 +319,12 @@ where
         }
     }
 
-    pub fn leader_handles_registry(&self) -> PartitionLeaderHandlesRegistry {
-        self.leader_handles_registry.clone()
-    }
-
     pub fn handle(&self) -> ProcessorsManagerHandle {
-        ProcessorsManagerHandle::new(self.tx.clone())
-    }
-
-    pub fn rule_book_cache_handle(&self) -> RuleBookCacheHandle {
-        self.rule_book_cache.clone()
+        ProcessorsManagerHandle::new(
+            self.tx.clone(),
+            Arc::new(self.rule_book_cache.clone()),
+            Arc::new(self.leader_handles_registry.clone()),
+        )
     }
 
     pub async fn run(mut self) -> anyhow::Result<()> {
@@ -417,6 +430,11 @@ where
         self.rx.close();
 
         self.health_status.update(WorkerStatus::Unknown);
+        // These gauges are only refreshed by get_state(), which no longer runs once the command
+        // channel is closed. Reset them so that a node that is shutting down does not keep
+        // exporting its last leader count.
+        gauge!(NUM_ACTIVE_PARTITIONS).set(0);
+        gauge!(NUM_ACTIVE_PARTITION_LEADERS).set(0);
 
         for task in self.snapshot_export_tasks.iter() {
             task.cancel();
@@ -561,6 +579,13 @@ where
                                             started_processor.rpc_shard_sender(),
                                         );
 
+                                    #[cfg(test)]
+                                    if let Some(tap) =
+                                        spawn_processor_task::STARTED_TAP.lock().as_ref()
+                                    {
+                                        let _ = tap
+                                            .send((partition_id, started_processor.query_ready()));
+                                    }
                                     let mut new_state = ProcessorState::started(
                                         started_processor,
                                         *start_time,
@@ -623,7 +648,6 @@ where
                         }
                     }
                     Err(err) => {
-                        // todo: metrics
                         info!(%partition_id, %err, "Partition processor failed to start");
                         self.processor_states.remove(&partition_id);
                         self.restart_partition_processor_if_replica(
@@ -824,6 +848,9 @@ where
                 // No-op: no snapshot repository, partition no longer in the partition table,
                 // or error fetching status (logged upstream)
             }
+            EventKind::DropRequestReady(request) => {
+                self.on_drop_request_ready(partition_id, request);
+            }
             EventKind::PartitionStoreDropped(result) => {
                 self.on_partition_store_dropped(partition_id, result);
             }
@@ -934,6 +961,10 @@ where
                 }
 
                 status.last_archived_log_lsn = latest_snapshot.map(|s| s.archived_lsn);
+                status.last_archived_log_byte_offset =
+                    latest_snapshot.and_then(|s| s.archived_log_byte_offset);
+                status.last_archived_byte_offsets_base_lsn =
+                    latest_snapshot.and_then(|s| s.archived_byte_offsets_base_lsn);
 
                 let current_tail_lsn = self.target_tail_lsns.get(partition_id).cloned();
                 let target_tail_lsn = if current_tail_lsn > status.target_tail_lsn {
@@ -978,6 +1009,16 @@ where
         match command {
             ProcessorsManagerCommand::GetState(sender) => {
                 let _ = sender.send(self.get_state());
+            }
+            ProcessorsManagerCommand::ReadPartition(request) => {
+                match self.processor_states.get(&request.partition) {
+                    Some(processor) => processor.read_partition(request),
+                    None => {
+                        let _ = request
+                            .response
+                            .send(Err(PartitionReadError::NotHosted(request.partition)));
+                    }
+                }
             }
         }
     }
@@ -1378,54 +1419,179 @@ where
         Ok(Box::new(epoch.into()))
     }
 
-    /// Deletes this node's local copy of a partition, on operator request.
+    /// Handles an operator's request to delete this node's local copy of a partition.
+    ///
+    /// Unless the request is forced, we first make sure that we know the partition's replica set
+    /// at least as well as the requester did. With an older one, this node could drop its store
+    /// although the requester saw that it was added back to the replica set, or refuse because it
+    /// doesn't know yet that it left. So we wait for a newer partition configuration, for a few
+    /// seconds at most, without blocking the partition's processor in the meantime.
+    fn on_drop_partition_store(&mut self, partition_id: PartitionId, request: DropRequest) {
+        let required = request.min_partition_configuration_version;
+        let observed = self.latest_configuration_version(partition_id);
+        if request.force || observed >= required {
+            self.try_drop_partition_store(partition_id, request);
+            return;
+        }
+
+        debug!(
+            %partition_id,
+            %observed,
+            %required,
+            "{}Waiting to learn about the partition configuration before dropping the partition \
+            store",
+            dry_run_prefix(request.dry_run)
+        );
+        let replica_set_states = self.replica_set_states.clone();
+        let cancellation = restate_core::cancellation_token();
+        self.asynchronous_operations
+            .build_task()
+            .name(&format!("drop-partition-store-wait-{partition_id}"))
+            .spawn(
+                async move {
+                    let configuration_observed = async {
+                        loop {
+                            // register before checking, so we don't miss an update in between
+                            let changed = replica_set_states.membership_changed();
+                            if replica_set_states
+                                .membership_state(partition_id)
+                                .latest_configuration_version()
+                                >= required
+                            {
+                                return;
+                            }
+                            changed.await;
+                        }
+                    };
+                    tokio::select! {
+                        _ = tokio::time::timeout(
+                            DROP_PARTITION_STORE_CONFIGURATION_WAIT,
+                            configuration_observed,
+                        ) => {}
+                        _ = cancellation.cancelled() => {}
+                    }
+                    AsynchronousEvent {
+                        partition_id,
+                        inner: EventKind::DropRequestReady(request),
+                    }
+                }
+                .in_current_tc(),
+            )
+            .expect("to spawn drop partition store wait task");
+    }
+
+    fn on_drop_request_ready(&mut self, partition_id: PartitionId, request: DropRequest) {
+        if is_shutting_down() {
+            // don't start deleting data on the way down, including while the node shuts down
+            // other roles before the worker; dropping the request fails the requester's RPC, so
+            // it can retry against the restarted node
+            return;
+        }
+
+        let required = request.min_partition_configuration_version;
+        let observed = self.latest_configuration_version(partition_id);
+        if observed < required {
+            refuse_drop(
+                partition_id,
+                request,
+                DropPartitionStoreError::PartitionConfigurationNotObserved { required, observed },
+            );
+            return;
+        }
+        self.try_drop_partition_store(partition_id, request);
+    }
+
+    fn latest_configuration_version(&self, partition_id: PartitionId) -> Version {
+        self.replica_set_states
+            .membership_state(partition_id)
+            .latest_configuration_version()
+    }
+
+    /// Deletes this node's local copy of a partition if that is safe. A dry run makes the same
+    /// checks and reports what would be deleted, without changing anything.
     ///
     /// We only touch the store once we are sure that no processor is using it: either this node
-    /// already gave up on the partition, or it isn't a replica of it, or - with `force` - we stop
-    /// the running processor and wait for it to terminate first. [`Self::pending_drops`] keeps the
-    /// manager from starting a new processor in the meantime.
-    #[instrument(level = "info", skip_all, fields(partition_id = %partition_id, force = %force))]
-    fn on_drop_partition_store(
-        &mut self,
-        partition_id: PartitionId,
-        force: bool,
-        sender: oneshot::Sender<DropResult>,
-    ) {
+    /// already gave up on the partition, or it is neither running the partition nor part of its
+    /// replica set. With `force`, we stop a running processor and wait for it to terminate first,
+    /// and drop the store of a replica too. [`Self::pending_drops`] keeps the manager from
+    /// starting a new processor in the meantime. Since this runs on the manager's event loop, no
+    /// processor can start between these checks and recording the pending drop.
+    fn try_drop_partition_store(&mut self, partition_id: PartitionId, request: DropRequest) {
         if self.pending_drops.contains_key(&partition_id) {
-            let _ = sender.send(Err(DropPartitionStoreError::DropInProgress));
+            refuse_drop(
+                partition_id,
+                request,
+                DropPartitionStoreError::DropInProgress,
+            );
             return;
         }
 
         if !self.partition_table.live_load().contains(&partition_id) {
             // without the partition's metadata we don't know which column family to drop
-            let _ = sender.send(Err(DropPartitionStoreError::UnknownPartition));
+            refuse_drop(
+                partition_id,
+                request,
+                DropPartitionStoreError::UnknownPartition,
+            );
             return;
         }
 
-        let awaiting_stop = match self.processor_states.get_mut(&partition_id) {
-            // this node isn't running the partition; nothing can race us
-            None => false,
-            Some(state) if state.is_broken() => {
+        // `Some(true)` if this node gave up on the partition, `Some(false)` if it runs it
+        let processor_broken = self
+            .processor_states
+            .get(&partition_id)
+            .map(|state| state.is_broken());
+        let refusal = match processor_broken {
+            Some(false) if !request.force => Some(DropPartitionStoreError::ProcessorRunning),
+            // e.g. a replica whose processor is waiting to be restarted
+            None if !request.force
+                && self
+                    .replica_set_states
+                    .membership_state(partition_id)
+                    .contains(Metadata::with_current(|m| m.my_node_id().as_plain())) =>
+            {
+                Some(DropPartitionStoreError::ReplicaSetMember)
+            }
+            _ => None,
+        };
+        if let Some(error) = refusal {
+            refuse_drop(partition_id, request, error);
+            return;
+        }
+
+        if request.dry_run {
+            self.spawn_drop_preview(partition_id, request);
+            return;
+        }
+
+        let awaiting_stop = match processor_broken {
+            Some(true) => {
                 // no runtime task to await, the processor is already gone
                 self.processor_states.remove(&partition_id);
                 false
             }
-            Some(_) if !force => {
-                let _ = sender.send(Err(DropPartitionStoreError::ProcessorRunning));
-                return;
-            }
-            Some(state) => {
-                warn!("Stopping a running partition processor to drop its local store");
-                state.stop();
+            Some(false) => {
+                warn!(
+                    %partition_id,
+                    reason = request.reason,
+                    "Stopping a running partition processor to drop its local store"
+                );
+                self.processor_states
+                    .get_mut(&partition_id)
+                    .expect("the processor is running")
+                    .stop();
                 true
             }
+            // this node isn't running the partition; nothing can race us
+            None => false,
         };
 
         self.pending_drops.insert(
             partition_id,
             PendingDrop {
                 awaiting_stop,
-                sender,
+                reason: request.reason,
+                sender: request.sender,
             },
         );
 
@@ -1442,6 +1608,41 @@ where
             .is_some_and(|pending| std::mem::take(&mut pending.awaiting_stop))
     }
 
+    /// Answers a dry run with what dropping the partition's local store would delete, without
+    /// touching the processor or the store.
+    fn spawn_drop_preview(&mut self, partition_id: PartitionId, request: DropRequest) {
+        let partition = self.partition_table.live_load().get(&partition_id).cloned();
+        let psm = self.partition_store_manager.clone();
+        tokio::spawn(
+            async move {
+                let result = match partition {
+                    None => Err(DropPartitionStoreError::UnknownPartition),
+                    Some(partition) => {
+                        drop_result(psm.preview_drop_partition_store(&partition).await, true)
+                    }
+                };
+                let reason = request.reason.as_str();
+                match &result {
+                    Ok(DropPartitionStoreOutcome::Dropped { deleted_bytes, .. }) => info!(
+                        %partition_id,
+                        reason,
+                        deleted_bytes =
+                            deleted_bytes.map(|bytes| field::display(ByteCount::from(bytes))),
+                        "[DRY RUN] Would drop local partition store on request"
+                    ),
+                    Ok(DropPartitionStoreOutcome::NoStoreFound { .. }) => {
+                        debug!(%partition_id, reason, "[DRY RUN] No local partition store to drop");
+                    }
+                    Err(err) => {
+                        warn!(%partition_id, reason, "[DRY RUN] Drop partition store request would fail: {err}");
+                    }
+                }
+                let _ = request.sender.send(result);
+            }
+            .in_current_tc(),
+        );
+    }
+
     fn spawn_drop_partition_store_task(&mut self, partition_id: PartitionId) {
         let partition = self.partition_table.live_load().get(&partition_id).cloned();
         let psm = self.partition_store_manager.clone();
@@ -1453,17 +1654,9 @@ where
                 async move {
                     let result = match partition {
                         None => Err(DropPartitionStoreError::UnknownPartition),
-                        Some(partition) => psm
-                            .drop_partition_store(&partition)
-                            .await
-                            .map(|dropped| {
-                                if dropped {
-                                    DropPartitionStoreOutcome::Dropped
-                                } else {
-                                    DropPartitionStoreOutcome::NoStoreFound
-                                }
-                            })
-                            .map_err(|err| DropPartitionStoreError::Internal(err.to_string())),
+                        Some(partition) => {
+                            drop_result(psm.drop_partition_store(&partition).await, false)
+                        }
                     };
 
                     AsynchronousEvent {
@@ -1477,18 +1670,33 @@ where
     }
 
     fn on_partition_store_dropped(&mut self, partition_id: PartitionId, result: DropResult) {
+        let pending = self.pending_drops.remove(&partition_id);
+        let reason = pending
+            .as_ref()
+            .map_or("", |pending| pending.reason.as_str());
         match &result {
-            Ok(outcome) => {
-                info!(%partition_id, "Drop partition store request completed: {outcome}");
-                // the partition can only have been blocked on data we just deleted
-                gauge!(PARTITION_BLOCKED_FLARE, PARTITION_LABEL => partition_id.to_string(), REASON_LABEL => FLARE_REASON_AHEAD_OF_LOG).set(0);
+            Ok(DropPartitionStoreOutcome::Dropped { deleted_bytes, .. }) => {
+                info!(
+                    %partition_id,
+                    reason,
+                    deleted_bytes =
+                        deleted_bytes.map(|bytes| field::display(ByteCount::from(bytes))),
+                    "Dropped local partition store on request"
+                );
+            }
+            Ok(DropPartitionStoreOutcome::NoStoreFound { .. }) => {
+                debug!(%partition_id, reason, "No local partition store to drop");
             }
             Err(err) => {
-                warn!(%partition_id, "Drop partition store request failed: {err}");
+                warn!(%partition_id, reason, "Drop partition store request failed: {err}");
             }
         }
+        if result.is_ok() {
+            // the partition can only have been blocked on data we just deleted
+            gauge!(PARTITION_BLOCKED_FLARE, PARTITION_LABEL => partition_id.to_string(), REASON_LABEL => FLARE_REASON_AHEAD_OF_LOG).set(0);
+        }
 
-        if let Some(pending) = self.pending_drops.remove(&partition_id) {
+        if let Some(pending) = pending {
             let _ = pending.sender.send(result);
         }
 
@@ -1504,7 +1712,16 @@ where
     ) {
         let (sender, rx) = oneshot::channel();
         let (reciprocal, body) = request.split();
-        self.on_drop_partition_store(body.partition_id, body.force, sender);
+        self.on_drop_partition_store(
+            body.partition_id,
+            DropRequest {
+                force: body.force,
+                dry_run: body.dry_run,
+                min_partition_configuration_version: body.min_partition_configuration_version,
+                reason: body.reason,
+                sender,
+            },
+        );
         tokio::spawn(async move {
             let Ok(result) = rx.await else {
                 // dropping the reciprocal will notify the sender that the request will not
@@ -1576,10 +1793,10 @@ where
     }
 
     /// Whether this node should be running a processor for the given partition, i.e. we are
-    /// part of its replica set, its local store is not being dropped, and the manager itself is
-    /// not shutting down.
+    /// part of its replica set, its local store is not being dropped, and neither the node nor
+    /// the manager is shutting down.
     fn should_run_processor(&self, partition_id: PartitionId) -> bool {
-        !restate_core::is_cancellation_requested()
+        !is_shutting_down()
             && !self.pending_drops.contains_key(&partition_id)
             && self
                 .replica_set_states
@@ -1587,13 +1804,17 @@ where
                 .contains(Metadata::with_current(|m| m.my_node_id().as_plain()))
     }
 
-    /// Starts a partition processor if this node is part of the replica set of the given partition.
-    /// Returns true if this node is part of the replica set of the given partition. Otherwise, false.
+    /// Requests a restart if this node should still run the partition processor.
+    /// Returns false if the processor is no longer eligible to run.
     fn restart_partition_processor_if_replica(
         &mut self,
         partition_id: PartitionId,
         delay: RestartDelay,
     ) -> bool {
+        if is_shutting_down() {
+            debug!(%partition_id, "Not restarting partition processor because shutdown is in progress");
+            return false;
+        }
         if !self.should_run_processor(partition_id) {
             return false;
         }
@@ -1604,6 +1825,13 @@ where
 
     #[instrument(level = "info", skip_all, fields(partition_id = %partition_id))]
     fn start_partition_processor(&mut self, partition_id: PartitionId, delay: Option<Duration>) {
+        // Node shutdown starts before the worker's task is cancelled. Reconciliation can still
+        // request starts in that window, but task-center no longer accepts new runtimes.
+        if is_shutting_down() {
+            debug!("Not starting partition processor because shutdown is in progress");
+            return;
+        }
+
         if self.pending_drops.contains_key(&partition_id) {
             // dropping the column family under a starting processor would corrupt it
             debug!("Not starting partition processor while its local store is being dropped");
@@ -1764,6 +1992,45 @@ enum ProvisionWorkerError {
     MetadataClient(#[from] ReadWriteError),
 }
 
+/// Whether the node is shutting down or this manager is being cancelled. Processors must not
+/// be started then: the task center no longer accepts new runtimes.
+fn is_shutting_down() -> bool {
+    TaskCenter::is_shutdown_requested() || restate_core::is_cancellation_requested()
+}
+
+/// Answers a drop request that this node won't carry out.
+fn refuse_drop(partition_id: PartitionId, request: DropRequest, error: DropPartitionStoreError) {
+    warn!(
+        %partition_id,
+        force = request.force,
+        reason = request.reason,
+        "{}Refusing to drop the local partition store: {error}",
+        dry_run_prefix(request.dry_run)
+    );
+    let _ = request.sender.send(Err(error));
+}
+
+/// Marks log messages about dry runs, so they aren't mistaken for actual drops.
+fn dry_run_prefix(dry_run: bool) -> &'static str {
+    if dry_run { "[DRY RUN] " } else { "" }
+}
+
+/// What a drop request returns for the store that the partition store manager dropped, or
+/// would drop in a dry run.
+fn drop_result<E: std::fmt::Display>(
+    result: Result<Option<DroppedPartitionStore>, E>,
+    dry_run: bool,
+) -> DropResult {
+    match result {
+        Ok(Some(store)) => Ok(DropPartitionStoreOutcome::Dropped {
+            deleted_bytes: store.disk_usage,
+            dry_run,
+        }),
+        Ok(None) => Ok(DropPartitionStoreOutcome::NoStoreFound { dry_run }),
+        Err(err) => Err(DropPartitionStoreError::Internal(err.to_string())),
+    }
+}
+
 struct AsynchronousEvent {
     partition_id: PartitionId,
     inner: EventKind,
@@ -1789,6 +2056,9 @@ enum EventKind {
         snapshot_status: PartitionSnapshotStatus,
     },
     SnapshotStatusUpdateSkipped,
+    /// A drop request is done waiting for this node to learn about a newer partition
+    /// configuration, or gave up waiting.
+    DropRequestReady(DropRequest),
     PartitionStoreDropped(DropResult),
 }
 
@@ -1849,33 +2119,48 @@ fn report_quantile_gauges(metric_name: &'static str, samples: &mut [u64]) {
 
 #[cfg(test)]
 mod tests {
-    use crate::partition_processor_manager::{PartitionProcessorManager, is_snapshot_due};
+    use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use googletest::IntoTestResult;
+    use test_log::test;
+    use tracing::info;
+
     use restate_bifrost::BifrostService;
     use restate_bifrost::providers::memory_loglet;
+    use restate_clock::UniqueTimestamp;
     use restate_core::partitions::PartitionRouting;
     use restate_core::{TaskCenter, TaskKind, TestCoreEnvBuilder};
     use restate_ingestion_client::{IngestionClient, SessionOptions};
-    use restate_partition_store::PartitionStoreManager;
+    use restate_partition_store::faults::{FaultPoint, Faults};
     use restate_partition_store::snapshots::PartitionSnapshotStatus;
+    use restate_partition_store::{PartitionStoreManager, ReadSnapshot};
     use restate_rocksdb::RocksDbManager;
+    use restate_storage_api::fsm_table::{FsmPosition, ReadFsmTable};
+    use restate_storage_query_api::QueryMetadata;
     use restate_types::cluster::cluster_state::PartitionProcessorStatus;
-    use restate_types::config::{AutomaticSnapshots, Configuration};
+    use restate_types::config::{AutomaticSnapshots, Configuration, ThrottlingOptions};
     use restate_types::health::HealthStatus;
     use restate_types::identifiers::PartitionId;
     use restate_types::live::Live;
+    use restate_types::logs::builder::LogsBuilder;
+    use restate_types::logs::metadata::{LogsConfiguration, ProviderConfiguration};
     use restate_types::logs::{LogId, Lsn, SequenceNumber};
     use restate_types::net::address::AdvertisedAddress;
+    use restate_types::net::metadata::MetadataKind;
     use restate_types::nodes_config::{NodeConfig, NodesConfiguration, Role};
     use restate_types::partitions::state::{
         MemberState, PartitionReplicaSetStates, ReplicaSetState,
     };
+    use restate_types::rate::Rate;
     use restate_types::time::MillisSinceEpoch;
     use restate_types::{GenerationalNodeId, RestateVersion, Version};
-    use std::num::{NonZeroU64, NonZeroUsize};
-    use std::time::Duration;
-    use test_log::test;
-    use tracing::info;
+    use restate_worker_api::{PartitionReadError, ProcessorsManagerHandle};
+
+    use crate::partition::QueryReadiness;
+    use crate::partition_processor_manager::spawn_processor_task;
+    use crate::partition_processor_manager::{PartitionProcessorManager, is_snapshot_due};
 
     #[test]
     fn snapshot_due_triggers() {
@@ -1916,6 +2201,245 @@ mod tests {
     }
 
     #[test(restate_core::test)]
+    async fn processor_starts_are_suppressed_before_worker_cancellation() -> anyhow::Result<()> {
+        use tokio::sync::oneshot;
+
+        use restate_core::cancellation_watcher;
+        use restate_types::net::metadata::MetadataKind;
+
+        use super::RestartDelay;
+
+        let node_id = GenerationalNodeId::new(42, 42);
+        let mut env_builder = TestCoreEnvBuilder::with_incoming_only_connector()
+            .set_my_node_id(node_id)
+            .add_mock_nodes_config();
+        RocksDbManager::init();
+        let bifrost_svc = BifrostService::new(env_builder.metadata_writer.clone())
+            .with_factory(memory_loglet::Factory::default());
+        let replica_set_states = PartitionReplicaSetStates::default();
+        let partition_id = PartitionId::MIN;
+        replica_set_states.note_observed_membership(
+            partition_id,
+            Default::default(),
+            &ReplicaSetState {
+                version: Version::MIN,
+                members: vec![MemberState {
+                    node_id: node_id.as_plain(),
+                    durable_lsn: Lsn::INVALID,
+                }],
+            },
+            &None,
+        );
+        let ingestion_client = IngestionClient::new(
+            env_builder.networking.clone(),
+            env_builder.metadata.updateable_partition_table(),
+            PartitionRouting::new(replica_set_states.clone(), TaskCenter::current()),
+            NonZeroUsize::new(10 * 1024 * 1024).unwrap(),
+            SessionOptions::default(),
+        );
+        let mut manager = PartitionProcessorManager::new(
+            HealthStatus::default(),
+            Live::from_value(Configuration::default()),
+            env_builder.metadata_writer.clone(),
+            PartitionStoreManager::create(false).await?,
+            replica_set_states,
+            &mut env_builder.router_builder,
+            bifrost_svc.handle(),
+            None,
+            ingestion_client,
+        );
+        let env = env_builder.build().await;
+        env.metadata
+            .wait_for_version(MetadataKind::PartitionTable, Version::MIN)
+            .await?;
+        assert!(manager.partition_table.live_load().contains(&partition_id));
+        assert!(manager.should_run_processor(partition_id));
+
+        // Hold shutdown before it cancels WorkerRole, with the node-wide flag already set.
+        let (reached, waiting) = oneshot::channel();
+        let (resume, resumed) = oneshot::channel();
+        TaskCenter::spawn(TaskKind::HttpIngressRole, "hold-shutdown", async move {
+            cancellation_watcher().await;
+            reached.send(()).unwrap();
+            resumed.await?;
+            Ok(())
+        })?;
+        let tc = TaskCenter::current();
+        let shutdown = tokio::spawn(async move { tc.shutdown_node("test completed", 0).await });
+        waiting.await?;
+        assert!(TaskCenter::is_shutdown_requested());
+        assert!(!restate_core::is_cancellation_requested());
+
+        assert!(!manager.should_run_processor(partition_id));
+        assert!(
+            !manager.restart_partition_processor_if_replica(partition_id, RestartDelay::Immediate)
+        );
+        manager.start_partition_processor(partition_id, None);
+        assert!(manager.processor_states.is_empty());
+        assert!(manager.asynchronous_operations.is_empty());
+
+        resume.send(()).unwrap();
+        shutdown.await?;
+        Ok(())
+    }
+
+    #[test(restate_core::test)]
+    async fn drop_partition_store_only_drops_stores_of_former_replicas() -> anyhow::Result<()> {
+        use tokio::sync::oneshot;
+
+        use restate_core::network::TransportConnect;
+        use restate_types::net::metadata::MetadataKind;
+        use restate_types::net::partition_processor_manager::{
+            DropPartitionStoreError, DropPartitionStoreOutcome,
+        };
+
+        use super::{DropRequest, DropResult};
+
+        fn request_drop<T: TransportConnect>(
+            manager: &mut PartitionProcessorManager<T>,
+            partition_id: PartitionId,
+            min_version: u32,
+            dry_run: bool,
+        ) -> oneshot::Receiver<DropResult> {
+            let (sender, rx) = oneshot::channel();
+            manager.on_drop_partition_store(
+                partition_id,
+                DropRequest {
+                    force: false,
+                    dry_run,
+                    min_partition_configuration_version: Version::from(min_version),
+                    reason: "test".to_owned(),
+                    sender,
+                },
+            );
+            rx
+        }
+
+        async fn answer<T: TransportConnect>(
+            manager: &mut PartitionProcessorManager<T>,
+            mut rx: oneshot::Receiver<DropResult>,
+        ) -> anyhow::Result<DropResult> {
+            // dry runs answer from a task of their own, other requests through the manager's
+            // asynchronous operations
+            loop {
+                tokio::select! {
+                    result = &mut rx => return Ok(result?),
+                    Some(event) = manager.asynchronous_operations.join_next() => {
+                        manager.on_asynchronous_event(event?);
+                    }
+                }
+            }
+        }
+
+        let node_id = GenerationalNodeId::new(42, 42);
+        let mut env_builder = TestCoreEnvBuilder::with_incoming_only_connector()
+            .set_my_node_id(node_id)
+            .add_mock_nodes_config();
+        RocksDbManager::init();
+        let bifrost_svc = BifrostService::new(env_builder.metadata_writer.clone())
+            .with_factory(memory_loglet::Factory::default());
+        let replica_set_states = PartitionReplicaSetStates::default();
+        let partition_id = PartitionId::MIN;
+        let note_replica_set = |version: u32, member: GenerationalNodeId| {
+            replica_set_states.note_observed_membership(
+                partition_id,
+                Default::default(),
+                &ReplicaSetState {
+                    version: Version::from(version),
+                    members: vec![MemberState {
+                        node_id: member.as_plain(),
+                        durable_lsn: Lsn::INVALID,
+                    }],
+                },
+                &None,
+            );
+        };
+        note_replica_set(1, node_id);
+        let partition_store_manager = PartitionStoreManager::create(false).await?;
+        let ingestion_client = IngestionClient::new(
+            env_builder.networking.clone(),
+            env_builder.metadata.updateable_partition_table(),
+            PartitionRouting::new(replica_set_states.clone(), TaskCenter::current()),
+            NonZeroUsize::new(10 * 1024 * 1024).unwrap(),
+            SessionOptions::default(),
+        );
+        let mut manager = PartitionProcessorManager::new(
+            HealthStatus::default(),
+            Live::from_value(Configuration::default()),
+            env_builder.metadata_writer.clone(),
+            partition_store_manager.clone(),
+            replica_set_states.clone(),
+            &mut env_builder.router_builder,
+            bifrost_svc.handle(),
+            None,
+            ingestion_client,
+        );
+        let env = env_builder.build().await;
+        env.metadata
+            .wait_for_version(MetadataKind::PartitionTable, Version::MIN)
+            .await?;
+        let partition = manager
+            .partition_table
+            .live_load()
+            .get(&partition_id)
+            .cloned()
+            .expect("partition is in the partition table");
+        drop(partition_store_manager.open(&partition, None).await?);
+
+        // A replica keeps its store even while it isn't running a processor. A dry run makes
+        // the same checks.
+        for dry_run in [false, true] {
+            let rx = request_drop(&mut manager, partition_id, 1, dry_run);
+            assert!(matches!(
+                answer(&mut manager, rx).await?,
+                Err(DropPartitionStoreError::ReplicaSetMember)
+            ));
+        }
+
+        // The request waits until this node learns that it left the replica set. A dry run
+        // reports the store it would drop, and leaves it in place for the actual drop.
+        let rx = request_drop(&mut manager, partition_id, 2, true);
+        tokio::task::yield_now().await;
+        assert!(
+            manager.pending_drops.is_empty(),
+            "doesn't block the processor"
+        );
+        note_replica_set(2, GenerationalNodeId::new(7, 1));
+        let Ok(DropPartitionStoreOutcome::Dropped {
+            deleted_bytes: Some(would_delete),
+            dry_run: true,
+        }) = answer(&mut manager, rx).await?
+        else {
+            panic!("the dry run finds the store");
+        };
+        let rx = request_drop(&mut manager, partition_id, 2, false);
+        assert!(matches!(
+            answer(&mut manager, rx).await?,
+            Ok(DropPartitionStoreOutcome::Dropped {
+                deleted_bytes: Some(deleted),
+                dry_run: false,
+            }) if deleted == would_delete
+        ));
+        assert!(manager.processor_states.is_empty());
+
+        let rx = request_drop(&mut manager, partition_id, 2, false);
+        assert!(matches!(
+            answer(&mut manager, rx).await?,
+            Ok(DropPartitionStoreOutcome::NoStoreFound { dry_run: false })
+        ));
+
+        // Without the newer configuration, the request gives up after a while.
+        tokio::time::pause();
+        let rx = request_drop(&mut manager, partition_id, 3, false);
+        assert!(matches!(
+            answer(&mut manager, rx).await?,
+            Err(DropPartitionStoreError::PartitionConfigurationNotObserved { required, observed })
+                if required == Version::from(3) && observed == Version::from(2)
+        ));
+        Ok(())
+    }
+
+    #[test(restate_core::test)]
     async fn proper_partition_processor_lifecycle_single_db() -> googletest::Result<()> {
         proper_partition_processor_lifecycle(false).await
     }
@@ -1925,10 +2449,18 @@ mod tests {
         proper_partition_processor_lifecycle(true).await
     }
 
-    /// This test ensures that the lifecycle of partition processors is properly managed by the
-    /// [`PartitionProcessorManager`]. See https://github.com/restatedev/restate/issues/2258 for
-    /// more details.
-    async fn proper_partition_processor_lifecycle(multi_db: bool) -> googletest::Result<()> {
+    /// A running partition processor manager of one node, with in-memory logs. Its
+    /// processors start once their partition's membership names the node.
+    struct Processors {
+        handle: ProcessorsManagerHandle,
+        replica_set_states: PartitionReplicaSetStates,
+        node_id: GenerationalNodeId,
+    }
+
+    async fn start_processors(
+        config: Configuration,
+        partition_store_manager: Arc<PartitionStoreManager>,
+    ) -> googletest::Result<Processors> {
         let mut nodes_config = NodesConfiguration::new_for_testing();
         let node_id = GenerationalNodeId::new(42, 42);
         let node_config = NodeConfig::builder()
@@ -1945,15 +2477,11 @@ mod tests {
             .set_nodes_config(nodes_config);
         let health_status = HealthStatus::default();
 
-        RocksDbManager::init();
-
         let bifrost_svc = BifrostService::new(env_builder.metadata_writer.clone())
             .with_factory(memory_loglet::Factory::default());
         let bifrost = bifrost_svc.handle();
 
         let replica_set_states = PartitionReplicaSetStates::default();
-
-        let partition_store_manager = PartitionStoreManager::create(multi_db).await?;
 
         let ingestion_client = IngestionClient::new(
             env_builder.networking.clone(),
@@ -1965,7 +2493,7 @@ mod tests {
 
         let partition_processor_manager = PartitionProcessorManager::new(
             health_status,
-            Live::from_value(Configuration::default()),
+            Live::from_value(config),
             env_builder.metadata_writer.clone(),
             partition_store_manager,
             replica_set_states.clone(),
@@ -1976,8 +2504,18 @@ mod tests {
         );
 
         // only needed for setting up the metadata
-        let _env = env_builder.build().await;
-        let processors_manager_handle = partition_processor_manager.handle();
+        let env = env_builder.build().await;
+        // Match the log default to this fixture's enabled in-memory provider, so
+        // that processors can read their logs.
+        env.metadata
+            .wait_for_version(MetadataKind::Logs, Version::MIN)
+            .await?;
+        let mut logs = LogsBuilder::try_from(env.metadata.logs_snapshot().as_ref().clone())?;
+        logs.set_configuration(LogsConfiguration {
+            default_provider: ProviderConfiguration::InMemory,
+        });
+        env.metadata_writer.update(Arc::new(logs.build())).await?;
+        let handle = partition_processor_manager.handle();
 
         bifrost_svc.start().await.into_test_result()?;
         TaskCenter::spawn(
@@ -1985,6 +2523,65 @@ mod tests {
             "partition-processor-manager",
             partition_processor_manager.run(),
         )?;
+        Ok(Processors {
+            handle,
+            replica_set_states,
+            node_id,
+        })
+    }
+
+    impl Processors {
+        /// Names this node the only member of `partition`, or no member at all.
+        fn set_membership(&self, partition: PartitionId, version: Version, member: bool) {
+            let members = if member {
+                vec![MemberState {
+                    node_id: self.node_id.as_plain(),
+                    durable_lsn: Lsn::INVALID,
+                }]
+            } else {
+                Vec::new()
+            };
+            self.replica_set_states.note_observed_membership(
+                partition,
+                Default::default(),
+                &ReplicaSetState { version, members },
+                &None,
+            );
+        }
+    }
+
+    /// This test ensures that the lifecycle of partition processors is properly managed by the
+    /// [`PartitionProcessorManager`]. See https://github.com/restatedev/restate/issues/2258 for
+    /// more details.
+    async fn proper_partition_processor_lifecycle(multi_db: bool) -> googletest::Result<()> {
+        RocksDbManager::init();
+        let Processors {
+            handle: processors_manager_handle,
+            replica_set_states,
+            node_id,
+        } = start_processors(
+            Configuration::default(),
+            PartitionStoreManager::create(multi_db).await?,
+        )
+        .await?;
+        let (started_tx, mut started) = tokio::sync::mpsc::unbounded_channel();
+        *spawn_processor_task::STARTED_TAP.lock() = Some(started_tx);
+        let query = Arc::new(QueryMetadata {
+            session_id: "processor-lifecycle".into(),
+            query_ts: UniqueTimestamp::MIN,
+            headers: Default::default(),
+            redacted_sql: "SELECT * FROM state".into(),
+            planning_duration: Duration::ZERO,
+        });
+        let mut admitted: Option<ReadSnapshot> = None;
+        assert_eq!(
+            processors_manager_handle
+                .read_partition(PartitionId::MIN, false, Arc::clone(&query))
+                .await
+                .unwrap_err(),
+            PartitionReadError::NotHosted(PartitionId::MIN),
+            "a partition without a processor isn't hosted here"
+        );
 
         let mut current_replica_set_node = ReplicaSetState {
             version: Version::MIN,
@@ -2020,6 +2617,24 @@ mod tests {
                 &None,
             );
 
+            if !has_node {
+                // Stopping the processor cancels the read it admitted and refuses
+                // new ones. Once released, the read no longer holds the partition.
+                let read = admitted
+                    .take()
+                    .expect("the previous processor admitted a read");
+                read.cancellation_token().cancelled().await;
+                assert!(matches!(
+                    processors_manager_handle
+                        .read_partition(PartitionId::MIN, false, Arc::clone(&query))
+                        .await,
+                    Err(PartitionReadError::Stopping(_))
+                ));
+                let closed = read.closed();
+                drop(read);
+                closed.await;
+            }
+
             loop {
                 let current_state = processors_manager_handle.get_state().await?;
 
@@ -2030,9 +2645,502 @@ mod tests {
                 }
             }
 
+            if has_node {
+                // A started processor admits reads once its loop is ready, each one
+                // a fresh, uncancelled snapshot of its own.
+                let (_, mut ready) = started.recv().await.unwrap();
+                ready
+                    .wait_for(|readiness| *readiness == QueryReadiness::Ready)
+                    .await
+                    .unwrap();
+                let read = processors_manager_handle
+                    .read_partition(PartitionId::MIN, false, Arc::clone(&query))
+                    .await
+                    .expect("the new processor admits a read");
+                assert_eq!(read.partition_id(), PartitionId::MIN);
+                assert!(!read.cancellation_token().is_cancelled());
+                admitted = Some(read);
+            }
+
             version = version.next();
         }
 
+        drop(admitted);
+        *spawn_processor_task::STARTED_TAP.lock() = None;
+        TaskCenter::shutdown_node("test completed", 0).await;
+        Ok(())
+    }
+
+    /// Writes `n` finished entries to `partition` while no index or statistic is
+    /// maintained, so a backfill has to walk them, then closes the store.
+    async fn seed_finished_entries(
+        stores: &PartitionStoreManager,
+        partition: &restate_types::partitions::Partition,
+        n: u64,
+        position: Option<FsmPosition>,
+    ) {
+        use restate_clock::RoughTimestamp;
+        use restate_storage_api::Transaction;
+        use restate_storage_api::invocation_status_table::{
+            CompletedInvocation, InvocationStatus, WriteInvocationStatusTable,
+        };
+        use restate_storage_api::vqueue_table::stats::EntryStatistics;
+        use restate_storage_api::vqueue_table::{
+            EntryContext, EntryKey, EntryMetadata, EntryStateRef, Stage, Status, WriteVQueueTable,
+        };
+        use restate_types::identifiers::{InvocationId, InvocationUuid};
+        use restate_types::vqueues::{EntryId, EntryTargetExt};
+
+        let mut store = stores.open(partition, None).await.unwrap();
+        if position.is_some() {
+            // A store with a position is not empty: initialize it first, so that its
+            // later opens find a storage version to migrate from.
+            store
+                .verify_and_run_migrations(Default::default(), &Configuration::default())
+                .await
+                .unwrap();
+        }
+        let mut tx = store.transaction();
+        // With a position, the commit persists it with the batch's bytes counted.
+        if let Some(position) = position {
+            tx.set_fsm_position(position);
+        }
+        for i in 0..n {
+            let partition_key = partition.key_range.start() + i;
+            let mut uuid = [0; 16];
+            uuid[..8].copy_from_slice(&i.to_be_bytes());
+            let id = InvocationId::from_parts(partition_key, InvocationUuid::from_bytes(uuid));
+            let status = CompletedInvocation::mock_neo_with_vqueue(partition_key);
+            let qid = status.vqueue_id.clone().unwrap();
+            let target = status.invocation_target.clone();
+            tx.put_invocation_status(&id, &InvocationStatus::Completed(status))
+                .unwrap();
+            let key = EntryKey::new(false, RoughTimestamp::new(10), i, EntryId::from(id));
+            let stats = EntryStatistics::new(
+                UniqueTimestamp::try_from_parts(100, 1).unwrap(),
+                key.run_at(),
+            );
+            tx.create_vqueue_entry_status(
+                &EntryContext {
+                    qid: &qid,
+                    target: &target.entry_target_ref(),
+                },
+                EntryStateRef {
+                    stage: Stage::Finished,
+                    status: Status::Succeeded,
+                    entry_key: &key,
+                    metadata: &EntryMetadata::default(),
+                    stats: &stats,
+                },
+            );
+        }
+        tx.commit().await.unwrap();
+        drop(tx);
+        drop(store);
+        stores.close(partition.partition_id).await;
+    }
+
+    /// Partition 0 of the fixture's partition table, seeded with `entries` finished
+    /// entries: a configuration that maintains the status gauges, so opening
+    /// registers them and starts their backfill, and the partition's faults.
+    async fn seeded_partition(
+        stores: &PartitionStoreManager,
+        entries: u64,
+    ) -> (Configuration, Faults) {
+        seeded_partition_at(stores, entries, None).await
+    }
+
+    /// [`seeded_partition`] with the partition at `position`, so that it tracks
+    /// byte offsets.
+    async fn seeded_partition_at(
+        stores: &PartitionStoreManager,
+        entries: u64,
+        position: Option<FsmPosition>,
+    ) -> (Configuration, Faults) {
+        let table = restate_types::partition_table::PartitionTable::with_equally_sized_partitions(
+            Version::MIN,
+            10,
+        );
+        let partition = restate_types::partitions::Partition::new(
+            PartitionId::MIN,
+            table.get(&PartitionId::MIN).unwrap().key_range,
+        );
+        seed_finished_entries(stores, &partition, entries, position).await;
+        let mut config = Configuration::default();
+        config.common.experimental.set_track_status_gauges(true);
+        (config, stores.faults(&partition))
+    }
+
+    /// Background throttling that caps every slice at `keys` entries, at a rate so
+    /// high that the cap, not the rate, sizes the slices.
+    fn slices_of(keys: u32) -> Option<ThrottlingOptions> {
+        Some(ThrottlingOptions {
+            rate: Rate::Second(NonZeroU32::MAX),
+            capacity: NonZeroU32::new(keys),
+        })
+    }
+
+    /// Lets the background step held at its pause point go ahead, and waits until
+    /// the next one is due and held.
+    async fn next_step(faults: &Faults, resume: &mut tokio::sync::oneshot::Sender<()>) {
+        let (reached, next) = faults.pause(FaultPoint::WalkStep);
+        drop(std::mem::replace(resume, next));
+        reached.await.unwrap();
+    }
+
+    /// Whether the service gauges are Complete in a new snapshot of `store`.
+    fn complete(store: &restate_partition_store::PartitionStore) -> bool {
+        use restate_partition_store::registry::IndexKind;
+
+        let snapshot = store.query_read(Default::default()).unwrap().0;
+        snapshot
+            .complete_index("service_stats/1", IndexKind::Aggregate)
+            .is_ok()
+    }
+
+    /// The service-gauge total of a snapshot read: entries counted once each.
+    fn service_total(snapshot: &ReadSnapshot) -> u64 {
+        use std::ops::ControlFlow;
+
+        use restate_partition_store::keys::selection::KeySelection;
+        use restate_partition_store::stats::StatValueCodec;
+        use restate_partition_store::stats::aggregated::{ServiceStats, StageStatusCounts};
+        use restate_storage_query_api::scan::BlockingScan;
+
+        let mut total = 0;
+        <ReadSnapshot as BlockingScan<ServiceStats>>::scan_blocking(
+            snapshot,
+            Arc::new(KeySelection::all()),
+            |(_, payload)| {
+                let counts = StageStatusCounts::deserialize_from(payload).unwrap();
+                total += counts.iter().map(|(_, count)| count).sum::<u64>();
+                ControlFlow::Continue(())
+            },
+        )
+        .unwrap();
+        total
+    }
+
+    /// Statistics backfill in a real processor: opening registers the
+    /// gauges and starts their walk, and the processor's backfill arm
+    /// runs it step by step while the processor serves. This fixture's processor
+    /// applies no record and serves no RPC, so a step counts as quiet unless a
+    /// query read was admitted while it waited, which the test does once. The
+    /// test holds every step at its pause point, so nothing depends on timing.
+    #[test(restate_core::test(flavor = "multi_thread", worker_threads = 4))]
+    async fn background_backfill_progresses_step_by_step_and_publishes_ready()
+    -> googletest::Result<()> {
+        RocksDbManager::init();
+        let stores = PartitionStoreManager::create(true).await?;
+        let (mut config, faults) = seeded_partition(&stores, 300).await;
+        config.worker.storage.background_migrations_throttling = slices_of(16);
+        let (reached, mut resume) = faults.pause(FaultPoint::WalkStep);
+        let processors = start_processors(config, Arc::clone(&stores)).await?;
+        processors.set_membership(PartitionId::MIN, Version::MIN, true);
+        reached.await.unwrap();
+        // The observer reads the store directly, not through the processor.
+        let store = stores.get_partition_store(PartitionId::MIN).await.unwrap();
+        assert!(!complete(&store));
+        assert_eq!(
+            store.walk_stats(),
+            restate_partition_store::walk::WalkStatsSnapshot::default()
+        );
+
+        // Each step takes one slice of the throttling's size.
+        for step in 1..=3 {
+            next_step(&faults, &mut resume).await;
+            let stats = store.walk_stats();
+            assert_eq!(
+                (stats.quiet_steps, stats.busy_steps, stats.examined),
+                (step, 0, 16 * step),
+                "{stats:?}"
+            );
+        }
+        assert!(!complete(&store));
+
+        // A query read admitted while a step waits makes that step busy; the next
+        // one is quiet again.
+        let query = Arc::new(QueryMetadata {
+            session_id: "backfill-load".into(),
+            query_ts: UniqueTimestamp::MIN,
+            headers: Default::default(),
+            redacted_sql: "SELECT * FROM sys_service_stats".into(),
+            planning_duration: Duration::ZERO,
+        });
+        let read = || {
+            processors
+                .handle
+                .read_partition(PartitionId::MIN, false, Arc::clone(&query))
+        };
+        drop(read().await.unwrap());
+        for (quiet, busy) in [(3, 1), (4, 1)] {
+            next_step(&faults, &mut resume).await;
+            let stats = store.walk_stats();
+            assert_eq!(
+                (stats.quiet_steps, stats.busy_steps),
+                (quiet, busy),
+                "{stats:?}"
+            );
+        }
+
+        // Unheld, the backfill runs to its end: Complete, each entry counted once, as
+        // a read admitted by the processor shows.
+        let (idle, _) = faults.pause(FaultPoint::WalksIdle);
+        drop(resume);
+        idle.await.unwrap();
+        assert!(complete(&store));
+        let snapshot = read().await.unwrap();
+        assert_eq!(service_total(&snapshot), 300);
+        let done = store.walk_stats();
+        assert_eq!(
+            (done.examined, done.busy_steps, done.failures),
+            (300, 1, 0),
+            "{done:?}"
+        );
+        drop((snapshot, store));
+        TaskCenter::shutdown_node("test completed", 0).await;
+        Ok(())
+    }
+
+    /// The status a processor reports once its partition store byte offset is
+    /// `offset`: the processor refreshes its position after a commit and
+    /// publishes the status on its timer.
+    async fn status_at_store_offset(
+        handle: &ProcessorsManagerHandle,
+        offset: u64,
+    ) -> PartitionProcessorStatus {
+        loop {
+            if let Some(status) = handle.get_state().await.unwrap().get(&PartitionId::MIN)
+                && status.partition_store_byte_offset == Some(offset)
+            {
+                return status.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A background commit alone advances the store byte offset the processor's
+    /// status reports, to the persisted value, while the applied LSN and the log
+    /// byte offset stay: the processor refreshes its position after the step.
+    #[test(restate_core::test(flavor = "multi_thread", worker_threads = 4))]
+    async fn background_backfill_commits_advance_the_reported_store_offset()
+    -> googletest::Result<()> {
+        RocksDbManager::init();
+        let stores = PartitionStoreManager::create(true).await?;
+        // A partition that tracks byte offsets from its first record, none applied
+        // yet: its log is empty, so nothing is ahead of it.
+        let position = FsmPosition {
+            applied_lsn: Lsn::INVALID,
+            byte_offsets_base_lsn: Lsn::OLDEST,
+            log_byte_offset: 0,
+            partition_store_byte_offset: 0,
+        };
+        let (mut config, faults) = seeded_partition_at(&stores, 300, Some(position)).await;
+        config.worker.storage.background_migrations_throttling = slices_of(16);
+        let (reached, mut resume) = faults.pause(FaultPoint::WalkStep);
+        let processors = start_processors(config, Arc::clone(&stores)).await?;
+        processors.set_membership(PartitionId::MIN, Version::MIN, true);
+        reached.await.unwrap();
+        let mut store = stores.get_partition_store(PartitionId::MIN).await.unwrap();
+        let before = store.get_fsm_position().await?.unwrap();
+        assert!(before.partition_store_byte_offset > 0, "{before:?}");
+        let reported =
+            status_at_store_offset(&processors.handle, before.partition_store_byte_offset).await;
+        assert_eq!(reported.byte_offsets_base_lsn, Some(Lsn::OLDEST));
+
+        // One step commits a slice through the processor's transaction.
+        next_step(&faults, &mut resume).await;
+        let after = store.get_fsm_position().await?.unwrap();
+        assert!(
+            after.partition_store_byte_offset > before.partition_store_byte_offset,
+            "{before:?} {after:?}"
+        );
+        assert_eq!(
+            (
+                after.applied_lsn,
+                after.byte_offsets_base_lsn,
+                after.log_byte_offset
+            ),
+            (
+                before.applied_lsn,
+                before.byte_offsets_base_lsn,
+                before.log_byte_offset
+            )
+        );
+        let reported =
+            status_at_store_offset(&processors.handle, after.partition_store_byte_offset).await;
+        assert_eq!(
+            (reported.byte_offsets_base_lsn, reported.log_byte_offset),
+            (Some(Lsn::OLDEST), Some(0)),
+            "{reported:?}"
+        );
+        drop((resume, store));
+        TaskCenter::shutdown_node("test completed", 0).await;
+        Ok(())
+    }
+
+    /// A snapshot export of a partition whose processor is backfilling. While the
+    /// export holds the processor's commit fence, each due backfill step commits
+    /// nothing and only schedules a recheck; once the export released the fence,
+    /// the backfill resumes and completes. The test holds every step at its pause
+    /// point and lets them go one at a time, so nothing depends on timing.
+    #[test(restate_core::test(flavor = "multi_thread", worker_threads = 4))]
+    async fn background_backfill_waits_out_a_held_export_fence() -> googletest::Result<()> {
+        use restate_partition_store::walk::WalkStatsSnapshot;
+        use restate_types::identifiers::SnapshotId;
+
+        RocksDbManager::init();
+        let (fences_tx, mut fences) = tokio::sync::mpsc::unbounded_channel();
+        *spawn_processor_task::FENCE_TAP.lock() = Some(fences_tx);
+        let stores = PartitionStoreManager::create(true).await?;
+        let (config, faults) = seeded_partition(&stores, 300).await;
+        let (reached, mut resume) = faults.pause(FaultPoint::WalkStep);
+        let processors = start_processors(config, Arc::clone(&stores)).await?;
+        processors.set_membership(PartitionId::MIN, Version::MIN, true);
+        let (_, fence_sender) = fences.recv().await.unwrap();
+
+        // The first step takes the walk's first slice.
+        reached.await.unwrap();
+        let store = stores.get_partition_store(PartitionId::MIN).await.unwrap();
+        assert_eq!(store.walk_stats(), WalkStatsSnapshot::default());
+        next_step(&faults, &mut resume).await;
+        let progressed = store.walk_stats();
+        assert!(
+            progressed.examined > 0 && progressed.examined < 300,
+            "{progressed:?}"
+        );
+
+        // The export of the partition, paused once its fence holds. The held step
+        // does not hold the processor, which grants the fence.
+        let (captured, release) = faults.pause(FaultPoint::SnapshotCapture);
+        let exports = restate_test_util::tempdir().unwrap();
+        let export = tokio::spawn({
+            let stores = Arc::clone(&stores);
+            let path = exports.path().join("export");
+            async move {
+                stores
+                    .export_partition(
+                        PartitionId::MIN,
+                        Some(&fence_sender),
+                        None,
+                        SnapshotId::new(),
+                        &path,
+                    )
+                    .await
+            }
+        });
+        captured.await.unwrap();
+        assert_eq!(store.walk_stats(), progressed);
+        // Every due step skips without work, and schedules the next.
+        for skips in 1..=3 {
+            next_step(&faults, &mut resume).await;
+            assert_eq!(
+                store.walk_stats(),
+                WalkStatsSnapshot {
+                    fence_skips: progressed.fence_skips + skips,
+                    ..progressed
+                },
+            );
+        }
+
+        drop(release);
+        // This fixture's processor applies no record, so the export, once released,
+        // stops at its applied-LSN precondition before capturing; that releases the
+        // fence just as a completed capture does.
+        assert!(matches!(
+            export.await.unwrap(),
+            Err(restate_partition_store::SnapshotError {
+                kind: restate_partition_store::SnapshotErrorKind::Export(_),
+                ..
+            })
+        ));
+        // Unheld from here, the backfill runs to its end, each entry examined once.
+        let (idle, _) = faults.pause(FaultPoint::WalksIdle);
+        drop(resume);
+        idle.await.unwrap();
+        let done = store.walk_stats();
+        assert_eq!((done.examined, done.fence_skips), (300, 3), "{done:?}");
+        assert!(complete(&store));
+        let snapshot = store.query_read(Default::default()).unwrap().0;
+        assert_eq!(service_total(&snapshot), 300);
+        drop((snapshot, store));
+        TaskCenter::shutdown_node("test completed", 0).await;
+        Ok(())
+    }
+
+    /// Processors replaced in the middle of a backfill commit: one while a slice's
+    /// native write is queued, which is then skipped, and one after a slice's write
+    /// but before its publication. Each replacement reloads the committed walk and
+    /// indexes on reopen, and the backfill completes with every entry counted
+    /// once. Pause points sequence every step, so nothing depends on timing.
+    #[test(restate_core::test(flavor = "multi_thread", worker_threads = 4))]
+    async fn background_backfill_survives_processor_replacement_mid_commit()
+    -> googletest::Result<()> {
+        use restate_rocksdb::Priority;
+
+        let rocksdb = RocksDbManager::init();
+        let stores = PartitionStoreManager::create(true).await?;
+        let (mut config, faults) = seeded_partition(&stores, 300).await;
+        config.worker.storage.background_migrations_throttling = slices_of(16);
+        // Commits queue on the storage pool, where a paused pool holds them. Commits
+        // read this option from the global configuration.
+        config.worker.storage.always_commit_in_background = true;
+        restate_types::config::set_current_config(config.clone());
+        let (reached, mut resume) = faults.pause(FaultPoint::WalkStep);
+        let processors = start_processors(config, Arc::clone(&stores)).await?;
+        let mut version = Version::MIN;
+        let mut member = |member: bool| {
+            processors.set_membership(PartitionId::MIN, version, member);
+            version = version.next();
+        };
+        let examined = async || {
+            stores
+                .get_partition_store(PartitionId::MIN)
+                .await
+                .unwrap()
+                .walk_stats()
+                .examined
+        };
+
+        // The walk's first slice commits.
+        member(true);
+        reached.await.unwrap();
+        next_step(&faults, &mut resume).await;
+        assert_eq!(examined().await, 16);
+
+        // The next slice's native write is queued on the held pool when its
+        // processor stops, dropping the commit. The write is then skipped.
+        let paused = rocksdb.pause_background(Priority::High).await;
+        let (queued, mut write) = faults.pause(FaultPoint::NativeWriteQueued);
+        drop(resume);
+        queued.await.unwrap();
+        member(false);
+        write.closed().await;
+        drop(paused);
+
+        // The replacement resumes after the committed slice. Its first slice's
+        // write completes, and its processor stops before the publication.
+        let (reached, resume) = faults.pause(FaultPoint::WalkStep);
+        member(true);
+        reached.await.unwrap();
+        assert_eq!(examined().await, 16, "the dropped slice charged nothing");
+        let (written, mut publication) = faults.pause(FaultPoint::WalkPublication);
+        drop(resume);
+        written.await.unwrap();
+        member(false);
+        publication.closed().await;
+
+        // The next replacement installs that slice from disk and continues after
+        // it: only the remaining entries are examined again.
+        let (idle, _) = faults.pause(FaultPoint::WalksIdle);
+        member(true);
+        idle.await.unwrap();
+        let store = stores.get_partition_store(PartitionId::MIN).await.unwrap();
+        assert_eq!(store.walk_stats().examined, 300 - 16);
+        assert!(complete(&store));
+        let snapshot = store.query_read(Default::default()).unwrap().0;
+        assert_eq!(service_total(&snapshot), 300, "every entry counted once");
+        drop((snapshot, store));
         TaskCenter::shutdown_node("test completed", 0).await;
         Ok(())
     }

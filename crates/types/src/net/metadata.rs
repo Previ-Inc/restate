@@ -68,12 +68,13 @@ impl WireDecode for GetMetadataRequest {
 impl WireEncode for MetadataUpdate {
     fn encode_to_bytes(&self, protocol_version: ProtocolVersion) -> Result<Bytes, EncodeError> {
         match protocol_version {
-            ProtocolVersion::Unknown
-            | ProtocolVersion::V2
-            | ProtocolVersion::V3
-            | ProtocolVersion::V4 => Ok(Bytes::from(codec::encode_as_flexbuffers(self))),
-            ProtocolVersion::V6 => Ok(wire::metadata_update_wire_encode(self, protocol_version)
-                .expect("encode to succeed")),
+            ProtocolVersion::Unknown | ProtocolVersion::V3 | ProtocolVersion::V4 => {
+                Ok(Bytes::from(codec::encode_as_flexbuffers(self)))
+            }
+            ProtocolVersion::V6 | ProtocolVersion::V7 => {
+                Ok(wire::metadata_update_wire_encode(self, protocol_version)
+                    .expect("encode to succeed"))
+            }
         }
     }
 }
@@ -88,11 +89,12 @@ impl WireDecode for MetadataUpdate {
         Self: Sized,
     {
         match protocol_version {
-            ProtocolVersion::Unknown
-            | ProtocolVersion::V2
-            | ProtocolVersion::V3
-            | ProtocolVersion::V4 => codec::decode_as_flexbuffers(buf, protocol_version),
-            ProtocolVersion::V6 => Ok(wire::metadata_update_wire_decode(buf, protocol_version)?),
+            ProtocolVersion::Unknown | ProtocolVersion::V3 | ProtocolVersion::V4 => {
+                codec::decode_as_flexbuffers(buf, protocol_version)
+            }
+            ProtocolVersion::V6 | ProtocolVersion::V7 => {
+                Ok(wire::metadata_update_wire_decode(buf, protocol_version)?)
+            }
         }
     }
 }
@@ -289,7 +291,7 @@ mod wire {
         value: &MetadataUpdate,
         protocol_version: ProtocolVersion,
     ) -> Result<Bytes, StorageEncodeError> {
-        assert_eq!(protocol_version, ProtocolVersion::V6);
+        assert!(protocol_version >= ProtocolVersion::V6);
 
         let mut bytes = BytesMut::new();
 
@@ -346,7 +348,7 @@ mod wire {
         mut buf: impl bytes::Buf,
         protocol_version: ProtocolVersion,
     ) -> Result<MetadataUpdate, StorageDecodeError> {
-        assert_eq!(protocol_version, ProtocolVersion::V6);
+        assert!(protocol_version >= ProtocolVersion::V6);
 
         let header = MetadataUpdateHeader::decode_length_delimited(&mut buf)
             .map_err(|err| StorageDecodeError::DecodeValue(err.into()))?;
@@ -399,7 +401,11 @@ mod tests {
             MetadataContainer::Schema(Arc::new(Schema::default())),
         ];
 
-        for protocol_version in [ProtocolVersion::V4, ProtocolVersion::V6] {
+        for protocol_version in [
+            ProtocolVersion::V4,
+            ProtocolVersion::V6,
+            ProtocolVersion::V7,
+        ] {
             for container in &containers {
                 let update = MetadataUpdate {
                     container: container.clone(),

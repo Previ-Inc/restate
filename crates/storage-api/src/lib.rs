@@ -13,6 +13,8 @@ use std::future::Future;
 use restate_memory::{NonZeroByteCount, OutOfMemory, OutOfMemoryKind};
 use restate_types::partitions::UnknownStorageVersion;
 
+pub use table::PrimaryKey;
+
 /// Storage error
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -26,6 +28,8 @@ pub enum StorageError {
     DataIntegrityError,
     #[error("operational error that can be caused during a graceful shutdown")]
     OperationalError,
+    #[error("storage scan was interrupted")]
+    ScanInterrupted,
     #[error("snapshot export failed: {0}")]
     SnapshotExport(anyhow::Error),
     #[error("precondition failed: {0}")]
@@ -38,8 +42,6 @@ pub type Result<T, E = StorageError> = std::result::Result<T, E>;
 
 /// Error type for budget-gated storage reads.
 ///
-/// Returned by budgeted stream methods on [`journal_table::ReadJournalTable`],
-/// [`journal_table_v2::ReadJournalTable`], and [`state_table::ReadStateTable`].
 /// Callers can distinguish between storage failures (retryable/fatal) and
 /// memory budget exhaustion.
 #[derive(Debug, thiserror::Error)]
@@ -62,6 +64,7 @@ impl From<OutOfMemory> for BudgetedReadError {
     }
 }
 
+pub mod blob_table;
 pub mod deduplication_table;
 pub mod fsm_table;
 pub mod inbox_table;
@@ -70,46 +73,24 @@ pub mod journal_events;
 pub mod journal_table;
 pub mod journal_table_v2;
 pub mod lock_table;
+pub mod migration_job;
 pub mod outbox_table;
 pub mod promise_table;
 pub mod protobuf_types;
+pub mod scan;
 pub mod service_status_table;
 pub mod state_table;
+mod table;
 pub mod timer_table;
 pub mod vqueue_table;
-
-/// Isolation level of a storage transaction
-#[derive(Debug, Default)]
-pub enum IsolationLevel {
-    /// Read committed writes during the execution of the transaction. Note, that this level does
-    /// not ensure repeatable reads since you might see committed writes from multiple transactions.
-    /// Use this level, if you know that you are the only writer.
-    #[default]
-    Committed,
-    /// Ensure repeatable reads during the execution of the transaction. Use this level,
-    /// if you need to do multiple reads and tolerate concurrent write operations.
-    ///
-    /// Note that using this level might be more costly than [`IsolationLevel::Committed`].
-    RepeatableReads,
-}
 
 pub trait Storage {
     type TransactionType<'a>: Transaction
     where
         Self: 'a;
 
-    /// Create a transaction with no read isolation level. This method should only be used if you
-    /// are the only writer to the [`Storage`] implementation. Otherwise, use
-    /// [`Storage::transaction_with_isolation`] and specify a proper [`IsolationLevel`] level.
-    fn transaction(&mut self) -> Self::TransactionType<'_> {
-        self.transaction_with_isolation(IsolationLevel::Committed)
-    }
-
-    /// Create a transaction with the given read isolation level.
-    fn transaction_with_isolation(
-        &mut self,
-        read_isolation: IsolationLevel,
-    ) -> Self::TransactionType<'_>;
+    /// Create a transaction over the current state of the storage.
+    fn transaction(&mut self) -> Self::TransactionType<'_>;
 }
 
 pub trait Transaction:
@@ -135,6 +116,8 @@ pub trait Transaction:
     + vqueue_table::ReadVQueueTable
     + vqueue_table::WriteVQueueTable
     + lock_table::WriteLockTable
+    + blob_table::WriteBlobTable
+    + blob_table::ReadBlobTable
     + Send
 {
     fn commit(&mut self) -> impl Future<Output = Result<()>> + Send;

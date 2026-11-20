@@ -9,65 +9,68 @@
 // by the Apache License, Version 2.0.
 
 use std::fmt::Debug;
-use std::ops::ControlFlow;
 use std::sync::Arc;
 
-use restate_partition_store::{PartitionStore, PartitionStoreManager};
-use restate_storage_api::StorageError;
+use datafusion::catalog::TableProvider;
+
+use restate_partition_store::vqueue_table::{EntryStatusRecords, EntryStatusScan};
+use restate_partition_store::{PartitionStoreManager, QueryIoExecutor, ReadSnapshot};
+use restate_storage_api::scan::ScanOutcome;
 use restate_storage_api::vqueue_table::filters::ScanEntryIdFilter;
-use restate_storage_api::vqueue_table::{RawStatusHeaderRef, ScanVQueueEntryStatusTable};
-use restate_types::identifiers::BaseEntryId;
 use restate_types::vqueues::VQueueId;
 
-use crate::context::{QueryContext, SelectPartitions};
+use crate::context::SelectPartitions;
 use crate::filter::{FirstMatchingPartitionKeyExtractor, VQueueEntryIdFilter};
-use crate::partition_store_scanner::{LocalPartitionsScanner, ScanLocalPartition};
+use crate::partition_store_scanner::{LocalPartitionsScanner, Rows, ScanLocalPartition};
 use crate::remote_query_scanner_manager::RemoteScannerManager;
 use crate::statistics::{DEPLOYMENT_ROW_ESTIMATE, RowEstimate, TableStatisticsBuilder};
 use crate::table_providers::{PartitionedTableProvider, ScanPartition};
 use crate::vqueue_entry_status::row::append_vqueue_entry_status_row;
 use crate::vqueue_entry_status::schema::{
-    SysVqueueEntryStatusBuilder, sys_vqueue_entry_status_sort_order,
+    SysVqueueEntryStatusBuilder, SysVqueueEntryStatusTable, sys_vqueue_entry_status_sort_order,
 };
 
-const NAME: &str = "sys_vqueue_entry_status";
+impl SysVqueueEntryStatusTable {
+    pub(crate) fn create_provider(
+        partition_selector: impl SelectPartitions,
+        remote_scanner_manager: &RemoteScannerManager,
+    ) -> Arc<dyn TableProvider> {
+        let schema = SysVqueueEntryStatusBuilder::schema();
 
-pub(crate) fn register_self(
-    ctx: &QueryContext,
-    partition_selector: impl SelectPartitions,
-    partition_store_manager: Arc<PartitionStoreManager>,
-    remote_scanner_manager: &RemoteScannerManager,
-) -> datafusion::common::Result<()> {
-    let local_scanner = Arc::new(LocalPartitionsScanner::new(
-        partition_store_manager,
-        VQueueEntryStatusScanner,
-    )) as Arc<dyn ScanPartition>;
+        let statistics = TableStatisticsBuilder::new(schema.clone())
+            .with_num_rows_estimate(RowEstimate::Large)
+            .with_partition_key()
+            .with_primary_key("entry_id")
+            .with_primary_key("canonical_id")
+            .with_foreign_key("deployment", DEPLOYMENT_ROW_ESTIMATE)
+            // This can be wrong in some rare cases, but the assumption is that
+            // the number of vqueue entries is bigger than the number of vqueues
+            .with_foreign_key("vqueue_id", RowEstimate::Small);
 
-    let schema = SysVqueueEntryStatusBuilder::schema();
+        let table = PartitionedTableProvider::new(
+            partition_selector,
+            schema,
+            sys_vqueue_entry_status_sort_order(),
+            remote_scanner_manager.create_distributed_scanner::<Self>(),
+            FirstMatchingPartitionKeyExtractor::default()
+                .with_grouped_vqueue_entry_id("entry_id")
+                .with_grouped_vqueue_entry_id("canonical_id")
+                .with_partitioned_resource_id::<VQueueId>("vqueue_id"),
+        )
+        .with_statistics(statistics.build());
 
-    let statistics = TableStatisticsBuilder::new(schema.clone())
-        .with_num_rows_estimate(RowEstimate::Large)
-        .with_partition_key()
-        .with_primary_key("entry_id")
-        .with_primary_key("canonical_id")
-        .with_foreign_key("deployment", DEPLOYMENT_ROW_ESTIMATE)
-        // This can be wrong in some rare cases, but the assumption is that
-        // the number of vqueue entries is bigger than the number of vqueues
-        .with_foreign_key("vqueue_id", RowEstimate::Small);
+        Arc::new(table)
+    }
 
-    let table = PartitionedTableProvider::new(
-        partition_selector,
-        schema,
-        sys_vqueue_entry_status_sort_order(),
-        remote_scanner_manager.create_distributed_scanner(NAME, local_scanner),
-        FirstMatchingPartitionKeyExtractor::default()
-            .with_grouped_vqueue_entry_id("entry_id")
-            .with_grouped_vqueue_entry_id("canonical_id")
-            .with_partitioned_resource_id::<VQueueId>("vqueue_id"),
-    )
-    .with_statistics(statistics.build());
-
-    ctx.register_partitioned_table(NAME, Arc::new(table))
+    pub(crate) fn create_local_scanner(
+        partition_store_manager: Arc<PartitionStoreManager>,
+        io_executor: QueryIoExecutor,
+    ) -> impl ScanPartition {
+        LocalPartitionsScanner::<VQueueEntryStatusScanner>::new(
+            partition_store_manager,
+            io_executor,
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -75,31 +78,25 @@ struct VQueueEntryStatusScanner;
 
 impl ScanLocalPartition for VQueueEntryStatusScanner {
     type Builder = SysVqueueEntryStatusBuilder;
-    type Item<'a> = (&'a BaseEntryId, &'a RawStatusHeaderRef<'a>);
-    type ConversionError = std::convert::Infallible;
     type Filter = VQueueEntryIdFilter;
 
-    fn for_each_row<
-        F: for<'a> FnMut(Self::Item<'a>) -> ControlFlow<Result<(), Self::ConversionError>>
-            + Send
-            + Sync
-            + 'static,
-    >(
-        partition_store: &PartitionStore,
+    async fn scan(
+        snapshot: &ReadSnapshot,
+        executor: &QueryIoExecutor,
         filter: VQueueEntryIdFilter,
-        mut f: F,
-    ) -> Result<impl Future<Output = restate_storage_api::Result<()>> + Send, StorageError> {
-        partition_store.for_each_vqueue_entry_status(filter.into(), move |id, header| {
-            f((id, header)).map_break(Result::unwrap)
-        })
-    }
-
-    fn append_row<'a>(
-        row_builder: &mut Self::Builder,
-        (id, header): Self::Item<'a>,
-    ) -> Result<(), Self::ConversionError> {
-        append_vqueue_entry_status_row(row_builder, id, header);
-        Ok(())
+        rows: Rows<Self::Builder>,
+    ) -> restate_storage_api::Result<ScanOutcome<Rows<Self::Builder>>> {
+        rows.read::<EntryStatusRecords>(
+            snapshot,
+            executor,
+            "df-vqueue-entry-status",
+            Arc::new(EntryStatusScan::from(ScanEntryIdFilter::from(filter))),
+            |builder, (id, header)| {
+                append_vqueue_entry_status_row(builder, &id, &header);
+                Ok(())
+            },
+        )
+        .await
     }
 }
 

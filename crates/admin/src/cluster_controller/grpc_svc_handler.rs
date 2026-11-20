@@ -9,6 +9,7 @@
 // by the Apache License, Version 2.0.
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::{Bytes, BytesMut};
@@ -18,16 +19,18 @@ use datafusion::error::DataFusionError;
 use futures::stream::BoxStream;
 use futures::{Stream, StreamExt};
 use tonic::codec::CompressionEncoding;
+use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::{Request, Response, Status, async_trait};
-use tracing::info;
+use tracing::{debug, info, warn};
 
 use restate_bifrost::loglet::FindTailOptions;
 use restate_bifrost::{Bifrost, Error as BiforstError};
 use restate_core::network::{RpcError, RpcReplyError};
 use restate_core::protobuf::cluster_ctrl_svc::{
-    ClusterStateRequest, ClusterStateResponse, CreatePartitionSnapshotRequest,
-    CreatePartitionSnapshotResponse, DescribeLogRequest, DescribeLogResponse,
-    DropPartitionStoreRequest, DropPartitionStoreResponse, FindTailRequest, FindTailResponse,
+    CheckClusterSafetyRequest, CheckClusterSafetyResponse, ClusterStateRequest,
+    ClusterStateResponse, CreatePartitionSnapshotRequest, CreatePartitionSnapshotResponse,
+    DescribeLogRequest, DescribeLogResponse, DomainImpact, DropPartitionStoreRequest,
+    DropPartitionStoreResponse, FailureDomain, FindTailRequest, FindTailResponse,
     GetClusterConfigurationRequest, GetClusterConfigurationResponse, ListLogsRequest,
     ListLogsResponse, MigrateMetadataRequest, MigrateMetadataResponse, QueryRequest, QueryResponse,
     QueryWarning, SealAndExtendChainRequest, SealAndExtendChainResponse, SealChainRequest,
@@ -38,17 +41,21 @@ use restate_core::protobuf::cluster_ctrl_svc::{
 };
 use restate_core::{Metadata, MetadataWriter};
 use restate_metadata_store::WriteError;
-use restate_storage_query_datafusion::context::{QueryContext, QueryError};
-use restate_storage_query_datafusion::node_fan_out::NodeWarnings;
+use restate_storage_query_api::errors::{QueryExecutionError, SessionError};
+use restate_storage_query_api::{
+    QueryDiagnostics, QueryEngine, QueryEngineVersion, QueryOptions, SessionOptions,
+    WriteRecordBatchStream,
+};
 use restate_types::config::{MetadataClientKind, MetadataClientOptions, NetworkingOptions};
 use restate_types::identifiers::PartitionId;
+use restate_types::locality::LocationScope;
 use restate_types::logs::metadata::{Logs, SegmentIndex};
 use restate_types::logs::{LogId, Lsn, SequenceNumber};
 use restate_types::metadata::{GlobalMetadata, Precondition};
 use restate_types::metadata_store::keys::{NODES_CONFIG_KEY, partition_processor_epoch_key};
 use restate_types::net::connect_opts::GrpcConnectionOptions;
 use restate_types::net::partition_processor_manager::{
-    DropPartitionStoreError, DropPartitionStoreOutcome, Snapshot,
+    self as net_ppm, DropPartitionStoreError, DropPartitionStoreOutcome, Snapshot,
 };
 use restate_types::nodes_config::{NodesConfiguration, Role};
 use restate_types::partitions::PartitionTable;
@@ -58,17 +65,54 @@ use restate_types::schema::Schema;
 use restate_types::storage::{StorageCodec, StorageEncode};
 use restate_types::{NodeId, PlainNodeId, Version, Versioned};
 
-use crate::query_utils::WriteRecordBatchStream;
-
 use super::ClusterControllerHandle;
+use super::safety_checker;
 use super::service::{ChainExtension, DropPartitionStoreRequestError};
+use crate::query_context::{
+    QUERY_ENGINE_HEADER, collect_query_headers, engine_version_from_headers,
+};
 
 pub(crate) struct ClusterCtrlSvcHandler {
     controller_handle: ClusterControllerHandle,
     bifrost: Bifrost,
     metadata_writer: MetadataWriter,
-    query_context: QueryContext,
+    cluster_query_engine: Arc<QueryEngine>,
+    /// Whether queries that don't select an engine run on V2
+    /// (`experimental-enable-query-engine-v2-default`), read at startup as for
+    /// admin `/query` requests.
+    query_engine_v2_default: bool,
     _replica_set_states: PartitionReplicaSetStates,
+}
+
+/// Session options for a cluster query: the `cluster` schema, no rate limit,
+/// and the engine the request selects with the `x-restate-query-engine`
+/// metadata, else the node's default. This is the rule admin `/query` requests
+/// follow too.
+pub(crate) fn cluster_query_options(
+    metadata: &MetadataMap,
+    v2_default: bool,
+) -> Result<(QueryEngineVersion, SessionOptions), Status> {
+    let default = if v2_default {
+        QueryEngineVersion::V2
+    } else {
+        QueryEngineVersion::V1
+    };
+    let engine = engine_version_from_headers(metadata.as_ref(), default).ok_or_else(|| {
+        Status::invalid_argument(format!(
+            "{QUERY_ENGINE_HEADER} must be `v1` or `v2`, sent at most once"
+        ))
+    })?;
+    Ok((
+        engine,
+        SessionOptions {
+            engine_version: Some(engine),
+            apply_rate_limit: false,
+            schemas: vec!["cluster".into()],
+            default_schema: Some("cluster".into()),
+            headers: collect_query_headers(metadata.as_ref()),
+            ..Default::default()
+        },
+    ))
 }
 
 impl ClusterCtrlSvcHandler {
@@ -76,14 +120,16 @@ impl ClusterCtrlSvcHandler {
         controller_handle: ClusterControllerHandle,
         bifrost: Bifrost,
         metadata_writer: MetadataWriter,
-        query_context: QueryContext,
+        cluster_query_engine: Arc<QueryEngine>,
+        query_engine_v2_default: bool,
         replica_set_states: PartitionReplicaSetStates,
     ) -> Self {
         Self {
             controller_handle,
             bifrost,
             metadata_writer,
-            query_context,
+            cluster_query_engine,
+            query_engine_v2_default,
             _replica_set_states: replica_set_states,
         }
     }
@@ -232,8 +278,8 @@ impl ClusterCtrlSvc for ClusterCtrlSvcHandler {
         }
     }
 
-    /// Handles requests from `restatectl partition drop-store` to delete a single node's local
-    /// copy of a partition. Implemented as an RPC call to the targeted worker node.
+    /// Handles requests from `restatectl` to delete a single node's local copy of a partition.
+    /// Implemented as an RPC call to the targeted worker node.
     async fn drop_partition_store(
         &self,
         request: Request<DropPartitionStoreRequest>,
@@ -251,20 +297,69 @@ impl ClusterCtrlSvc for ClusterCtrlSvcHandler {
                 .ok_or_else(|| Status::invalid_argument("node_id is required"))?,
         )
         .id();
+        let force = request.force;
+        let requested_dry_run = request.dry_run;
+        let reason = request.reason;
+        // marks log messages about dry runs, so they aren't mistaken for actual drops
+        let prefix = if requested_dry_run { "[DRY RUN] " } else { "" };
 
-        match self
+        let result = self
             .controller_handle
-            .drop_partition_store(partition_id, node_id, request.force)
+            .drop_partition_store(
+                node_id,
+                net_ppm::DropPartitionStoreRequest {
+                    partition_id,
+                    force,
+                    min_partition_configuration_version: request
+                        .min_partition_configuration_version
+                        .map(Version::from)
+                        .unwrap_or(Version::INVALID),
+                    reason: reason.clone(),
+                    dry_run: requested_dry_run,
+                },
+            )
             .await
-            .map_err(|_| Status::unavailable("Node is shutting down"))?
-        {
+            .map_err(|_| Status::unavailable("Node is shutting down"))?;
+
+        // `dry_run` in the response is what the node did, which differs from the request if the
+        // node doesn't support dry runs
+        match result {
+            Ok(DropPartitionStoreOutcome::Dropped {
+                deleted_bytes,
+                dry_run,
+            }) => {
+                if dry_run {
+                    info!(%partition_id, %node_id, force, reason, "[DRY RUN] Would drop partition store");
+                } else if requested_dry_run {
+                    warn!(
+                        %partition_id,
+                        %node_id,
+                        force,
+                        reason,
+                        "A dry run was requested, but the node doesn't support dry runs and \
+                        dropped the partition store"
+                    );
+                } else {
+                    info!(%partition_id, %node_id, force, reason, "Dropped partition store");
+                }
+                Ok(Response::new(DropPartitionStoreResponse {
+                    dropped: true,
+                    deleted_bytes,
+                    dry_run,
+                }))
+            }
+            Ok(DropPartitionStoreOutcome::NoStoreFound { dry_run }) => {
+                debug!(%partition_id, %node_id, force, reason, "{prefix}No partition store to drop");
+                Ok(Response::new(DropPartitionStoreResponse {
+                    dropped: false,
+                    deleted_bytes: None,
+                    dry_run,
+                }))
+            }
             Err(err) => {
-                info!("Failed to drop partition store: {err}");
+                warn!(%partition_id, %node_id, force, reason, "{prefix}Could not drop partition store: {err}");
                 Err(drop_partition_store_status(err))
             }
-            Ok(outcome) => Ok(Response::new(DropPartitionStoreResponse {
-                dropped: matches!(outcome, DropPartitionStoreOutcome::Dropped),
-            })),
         }
     }
 
@@ -465,38 +560,66 @@ impl ClusterCtrlSvc for ClusterCtrlSvcHandler {
         &self,
         request: Request<QueryRequest>,
     ) -> std::result::Result<Response<Self::QueryStream>, tonic::Status> {
+        let (engine, options) =
+            cluster_query_options(request.metadata(), self.query_engine_v2_default)?;
         let request = request.into_inner();
-        let query_result = self
-            .query_context
-            .execute(&request.query)
-            .await
-            .map_err(datafusion_query_error_to_status)?;
+        let session = match self.cluster_query_engine.create_session(options) {
+            Ok(session) => session,
+            Err(e @ (SessionError::EngineDisabled | SessionError::VersionUnavailable(_))) => {
+                return Err(Status::unimplemented(e.to_string()));
+            }
+            Err(e @ SessionError::RateLimited(_)) => {
+                return Err(Status::resource_exhausted(e.to_string()));
+            }
+            Err(e @ SessionError::DataFusion(_)) => {
+                return Err(Status::internal(e.to_string()));
+            }
+        };
 
-        let node_warnings = query_result.node_warnings;
+        let query_result = session
+            .execute(&request.query, QueryOptions {})
+            .await
+            .map_err(query_error_to_status)?;
+
+        let diagnostics = query_result.diagnostics;
+        let session_id = query_result
+            .metadata
+            .session_id
+            .as_str()
+            .parse()
+            .map_err(|err| Status::internal(format!("Invalid query session ID: {err}")))?;
 
         let data_stream = WriteRecordBatchStream::<StreamWriter<Vec<u8>>>::new(
             query_result.stream,
-            request.query,
+            query_result.metadata,
         )
-        .map_err(datafusion_error_to_status)?
+        .map_err(df_error_to_status)?
         .map(|item| {
             item.map(|encoded| QueryResponse {
                 encoded,
                 ..Default::default()
             })
-            .map_err(datafusion_error_to_status)
+            .map_err(df_error_to_status)
         });
 
         // Wrap the data stream to attach per-node warnings to the final
         // response message, avoiding an extra trailing empty-data message.
         let stream = QueryWarningStream {
             inner: data_stream.boxed(),
-            node_warnings,
+            diagnostics,
             last_response: None,
             done: false,
         };
 
-        Ok(Response::new(stream.boxed()))
+        let mut response = Response::new(stream.boxed());
+        response
+            .metadata_mut()
+            .insert("x-restate-query-session-id", session_id);
+        response.metadata_mut().insert(
+            QUERY_ENGINE_HEADER,
+            MetadataValue::from_static(engine.as_str()),
+        );
+        Ok(response)
     }
 
     /// Migrate metadata from the current metadata store to a target store
@@ -618,6 +741,75 @@ impl ClusterCtrlSvc for ClusterCtrlSvcHandler {
 
         Ok(Response::new(SyncEpochMetadataResponse {}))
     }
+
+    async fn check_cluster_safety(
+        &self,
+        request: Request<CheckClusterSafetyRequest>,
+    ) -> Result<Response<CheckClusterSafetyResponse>, Status> {
+        let assume_dead: Vec<PlainNodeId> = request
+            .into_inner()
+            .assume_dead_nodes
+            .into_iter()
+            .map(PlainNodeId::from)
+            .collect();
+
+        if let Some(node_id) = assume_dead.iter().find(|node_id| {
+            Metadata::with_current(|m| m.nodes_config_ref().find_node_by_id(**node_id).is_err())
+        }) {
+            return Err(Status::invalid_argument(format!(
+                "Node {node_id} is not part of the cluster"
+            )));
+        }
+
+        let report = self
+            .controller_handle
+            .check_cluster_safety(assume_dead)
+            .await
+            .map_err(|_| Status::aborted("Node is shutting down"))?
+            .map_err(|err| Status::internal(err.to_string()))?;
+
+        Ok(Response::new(CheckClusterSafetyResponse {
+            write_unavailable_logs: convert_all(report.write_unavailable_logs),
+            read_unavailable_logs: convert_all(report.read_unavailable_logs),
+            write_at_risk_logs: convert_all(report.write_at_risk_logs),
+            read_at_risk_logs: convert_all(report.read_at_risk_logs),
+            unchecked_logs: convert_all(report.unchecked_logs),
+            unavailable_partitions: convert_all(report.unavailable_partitions),
+            at_risk_partitions: convert_all(report.at_risk_partitions),
+            unchecked_partitions: convert_all(report.unchecked_partitions),
+            domain_impacts: report
+                .domain_impacts
+                .into_iter()
+                .map(|(domain, impact)| DomainImpact {
+                    domain: Some(domain.into()),
+                    write_unavailable_logs: convert_all(impact.write_unavailable_logs),
+                    read_unavailable_logs: convert_all(impact.read_unavailable_logs),
+                    unavailable_partitions: convert_all(impact.unavailable_partitions),
+                })
+                .collect(),
+            scope: report.scope.map(scope_name),
+            dead_nodes: convert_all(report.dead_nodes),
+            num_logs: report.num_logs as u32,
+            num_partitions: report.num_partitions as u32,
+        }))
+    }
+}
+
+fn convert_all<T: Into<U>, U>(items: impl IntoIterator<Item = T>) -> Vec<U> {
+    items.into_iter().map(Into::into).collect()
+}
+
+fn scope_name(scope: LocationScope) -> String {
+    scope.to_string().to_lowercase()
+}
+
+impl From<safety_checker::FailureDomain> for FailureDomain {
+    fn from(domain: safety_checker::FailureDomain) -> Self {
+        Self {
+            scope: scope_name(domain.scope),
+            name: domain.name,
+        }
+    }
 }
 
 fn drop_partition_store_status(error: DropPartitionStoreRequestError) -> Status {
@@ -628,8 +820,12 @@ fn drop_partition_store_status(error: DropPartitionStoreRequestError) -> Status 
         DropPartitionStoreRequestError::Worker { node_id, error } => {
             let message = format!("{node_id} refused to drop its partition store: {error}");
             match error {
-                DropPartitionStoreError::ProcessorRunning => Status::failed_precondition(message),
-                DropPartitionStoreError::DropInProgress => Status::aborted(message),
+                DropPartitionStoreError::ProcessorRunning
+                | DropPartitionStoreError::ReplicaSetMember => Status::failed_precondition(message),
+                DropPartitionStoreError::DropInProgress
+                | DropPartitionStoreError::PartitionConfigurationNotObserved { .. } => {
+                    Status::aborted(message)
+                }
                 DropPartitionStoreError::UnknownPartition => Status::not_found(message),
                 DropPartitionStoreError::Internal(_) => Status::internal(message),
             }
@@ -666,7 +862,7 @@ fn serialize_value<T: StorageEncode>(value: &T) -> Bytes {
 /// to that final response before yielding it.
 struct QueryWarningStream {
     inner: BoxStream<'static, Result<QueryResponse, Status>>,
-    node_warnings: Vec<NodeWarnings>,
+    diagnostics: Arc<dyn QueryDiagnostics>,
     last_response: Option<Result<QueryResponse, Status>>,
     done: bool,
 }
@@ -686,7 +882,15 @@ impl Stream for QueryWarningStream {
                     self.done = true;
                     // Inner stream ended. Yield the buffered last response
                     // with warnings attached, or a warnings-only response.
-                    let warnings = drain_node_warnings(&self.node_warnings);
+                    let warnings = self
+                        .diagnostics
+                        .warnings()
+                        .into_iter()
+                        .map(|w| QueryWarning {
+                            node_id: w.node_id.to_string(),
+                            message: w.message.to_string(),
+                        })
+                        .collect::<Vec<_>>();
                     return match self.last_response.take() {
                         Some(Ok(mut resp)) => {
                             resp.warnings = warnings;
@@ -716,25 +920,18 @@ impl Stream for QueryWarningStream {
     }
 }
 
-fn drain_node_warnings(node_warnings: &[NodeWarnings]) -> Vec<QueryWarning> {
-    let mut out = Vec::new();
-    for nw in node_warnings {
-        out.extend(nw.lock().drain(..).map(|w| QueryWarning {
-            node_id: w.node_id,
-            message: w.message,
-        }));
-    }
-    out
-}
-
-fn datafusion_query_error_to_status(err: QueryError) -> Status {
+fn query_error_to_status(err: QueryExecutionError) -> Status {
     match err {
-        QueryError::DataFusion(e) => datafusion_error_to_status(e),
-        err @ QueryError::RateLimited(_) => Status::resource_exhausted(err.to_string()),
+        QueryExecutionError::DataFusion(
+            DataFusionError::SQL(..)
+            | DataFusionError::Execution(..)
+            | DataFusionError::SchemaError(..),
+        ) => Status::invalid_argument(err.to_string()),
+        _ => Status::internal(err.to_string()),
     }
 }
 
-fn datafusion_error_to_status(err: DataFusionError) -> Status {
+fn df_error_to_status(err: DataFusionError) -> Status {
     match err {
         DataFusionError::SQL(..)
         | DataFusionError::Execution(..)
@@ -768,6 +965,17 @@ mod drop_partition_store_tests {
                 DropPartitionStoreError::Internal("failed".to_owned()),
                 tonic::Code::Internal,
             ),
+            (
+                DropPartitionStoreError::ReplicaSetMember,
+                tonic::Code::FailedPrecondition,
+            ),
+            (
+                DropPartitionStoreError::PartitionConfigurationNotObserved {
+                    required: Version::from(7),
+                    observed: Version::from(5),
+                },
+                tonic::Code::Aborted,
+            ),
         ] {
             let status = drop_partition_store_status(DropPartitionStoreRequestError::Worker {
                 node_id,
@@ -783,5 +991,53 @@ mod drop_partition_store_tests {
             .code(),
             tonic::Code::FailedPrecondition
         );
+    }
+}
+
+#[cfg(test)]
+mod query_engine_tests {
+    use tonic::Code;
+    use tonic::metadata::{MetadataMap, MetadataValue};
+
+    use restate_storage_query_api::QueryEngineVersion::{V1, V2};
+
+    use super::*;
+
+    /// `restatectl sql` selects the engine like an admin `/query` request: the
+    /// `x-restate-query-engine` metadata if sent, else the node's default.
+    #[test]
+    fn cluster_queries_select_the_engine_like_admin_queries() {
+        let metadata = |values: &[&'static str]| {
+            let mut metadata = MetadataMap::new();
+            for value in values {
+                metadata.append(QUERY_ENGINE_HEADER, MetadataValue::from_static(value));
+            }
+            metadata
+        };
+        for (v2_default, selection, expected) in [
+            (false, &[][..], V1),
+            (true, &[][..], V2),
+            (true, &["v1"][..], V1),
+            (false, &["v2"][..], V2),
+        ] {
+            let (engine, options) =
+                cluster_query_options(&metadata(selection), v2_default).unwrap();
+            assert_eq!(
+                (engine, options.engine_version),
+                (expected, Some(expected)),
+                "default_v2={v2_default} selection={selection:?}"
+            );
+            // The selector isn't forwarded as a diagnostic header.
+            assert!(!options.headers.contains_key(QUERY_ENGINE_HEADER));
+        }
+        for selection in [&["v3"][..], &["v1", "v2"][..]] {
+            assert_eq!(
+                cluster_query_options(&metadata(selection), false)
+                    .unwrap_err()
+                    .code(),
+                Code::InvalidArgument,
+                "{selection:?}"
+            );
+        }
     }
 }

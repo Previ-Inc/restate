@@ -12,4 +12,4 @@ mod row;
 pub(crate) mod schema;
 mod table;
 
-pub use table::register_self;
+pub use table::create_scanner;

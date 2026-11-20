@@ -33,12 +33,7 @@ use restate_core::network::{
 use restate_core::{Metadata, MetadataWriter, ShutdownError, TaskCenter, TaskKind};
 use restate_core::{cancellation_token, my_node_id};
 use restate_metadata_store::ReadModifyWriteError;
-use restate_storage_query_datafusion::BuildError;
-use restate_storage_query_datafusion::context::{ClusterTables, QueryContext};
-use restate_storage_query_datafusion::remote_query_scanner_client::create_remote_scanner_service;
-use restate_storage_query_datafusion::remote_query_scanner_manager::{
-    RemoteScannerManager, create_partition_locator,
-};
+use restate_storage_query_api::QueryEngine;
 use restate_types::cluster::cluster_state::LegacyClusterState;
 use restate_types::config::{AdminOptions, Configuration};
 use restate_types::health::HealthStatus;
@@ -67,7 +62,9 @@ use restate_types::{GenerationalNodeId, NodeId, PlainNodeId, Version};
 
 use crate::cluster_controller::cluster_state_refresher::ClusterStateRefresher;
 use crate::cluster_controller::grpc_svc_handler::ClusterCtrlSvcHandler;
+use crate::cluster_controller::safety_checker::SafetyReport;
 use crate::cluster_controller::service::cluster_controller_state::ClusterControllerState;
+use crate::cluster_controller::service::scheduler_task::SafetyCheckRequest;
 
 #[derive(Debug, thiserror::Error, CodedError)]
 pub enum Error {
@@ -96,7 +93,7 @@ where
     T: TransportConnect,
 {
     #[allow(clippy::too_many_arguments)]
-    pub async fn create(
+    pub fn create(
         mut configuration: Live<Configuration>,
         health_status: HealthStatus<AdminStatus>,
         replica_set_states: PartitionReplicaSetStates,
@@ -104,34 +101,15 @@ where
         networking: Networking<T>,
         server_builder: &mut NetworkServerBuilder,
         metadata_writer: MetadataWriter,
-    ) -> Result<Self, BuildError> {
+        cluster_state_refresher: ClusterStateRefresher<T>,
+        query_engine: Arc<QueryEngine>,
+    ) -> Self {
         let (command_tx, command_rx) = mpsc::channel(2);
-
-        let cluster_state_refresher = ClusterStateRefresher::new(networking.clone());
 
         let processor_manager_client = PartitionProcessorManagerClient::new(networking.clone());
 
         let options = configuration.live_load();
         let heartbeat_interval = Self::create_heartbeat_interval(&options.admin);
-
-        let remote_scanner_manager = RemoteScannerManager::new(
-            create_remote_scanner_service(networking.clone()),
-            create_partition_locator(
-                restate_core::partitions::PartitionRouting::new(
-                    replica_set_states.clone(),
-                    TaskCenter::current(),
-                ),
-                Metadata::current(),
-            ),
-            Metadata::current(),
-        );
-        let cluster_tables = ClusterTables::new(
-            replica_set_states.clone(),
-            cluster_state_refresher.cluster_state_watcher().watch(),
-            remote_scanner_manager,
-        );
-        let cluster_query_context =
-            QueryContext::create(&options.admin.query_engine, cluster_tables).await?;
 
         // Registering ClusterCtrlSvc grpc service to network server
         server_builder.register_grpc_service(
@@ -142,7 +120,11 @@ where
                     },
                     bifrost.clone(),
                     metadata_writer.clone(),
-                    cluster_query_context,
+                    query_engine,
+                    options
+                        .common
+                        .experimental
+                        .is_query_engine_v2_default_enabled(),
                     replica_set_states.clone(),
                 )
                 .into_server(&configuration.live_load().networking),
@@ -151,7 +133,7 @@ where
             restate_core::protobuf::cluster_ctrl_svc::FILE_DESCRIPTOR_SET,
         );
 
-        Ok(Service {
+        Service {
             configuration,
             health_status,
             networking,
@@ -163,7 +145,7 @@ where
             command_tx,
             command_rx,
             heartbeat_interval,
-        })
+        }
     }
 
     fn create_heartbeat_interval(options: &AdminOptions) -> Interval {
@@ -217,9 +199,8 @@ enum ClusterControllerCommand {
         response_tx: oneshot::Sender<anyhow::Result<Snapshot>>,
     },
     DropPartitionStore {
-        partition_id: PartitionId,
         node_id: PlainNodeId,
-        force: bool,
+        request: DropPartitionStoreRequest,
         response_tx:
             oneshot::Sender<Result<DropPartitionStoreOutcome, DropPartitionStoreRequestError>>,
     },
@@ -247,6 +228,7 @@ enum ClusterControllerCommand {
         partition_ids: Vec<PartitionId>,
         response_tx: oneshot::Sender<anyhow::Result<()>>,
     },
+    CheckClusterSafety(SafetyCheckRequest),
 }
 
 pub struct ClusterControllerHandle {
@@ -323,9 +305,8 @@ impl ClusterControllerHandle {
     /// Asks a specific node to delete its local copy of a partition.
     pub(crate) async fn drop_partition_store(
         &self,
-        partition_id: PartitionId,
         node_id: PlainNodeId,
-        force: bool,
+        request: DropPartitionStoreRequest,
     ) -> Result<Result<DropPartitionStoreOutcome, DropPartitionStoreRequestError>, ShutdownError>
     {
         let (response_tx, response_rx) = oneshot::channel();
@@ -333,9 +314,8 @@ impl ClusterControllerHandle {
         let _ = self
             .tx
             .send(ClusterControllerCommand::DropPartitionStore {
-                partition_id,
                 node_id,
-                force,
+                request,
                 response_tx,
             })
             .await;
@@ -422,6 +402,25 @@ impl ClusterControllerHandle {
                 partition_ids,
                 response_tx,
             })
+            .await;
+
+        response_rx.await.map_err(|_| ShutdownError)
+    }
+
+    pub async fn check_cluster_safety(
+        &self,
+        assume_dead: Vec<PlainNodeId>,
+    ) -> Result<anyhow::Result<SafetyReport>, ShutdownError> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let _ = self
+            .tx
+            .send(ClusterControllerCommand::CheckClusterSafety(
+                SafetyCheckRequest {
+                    assume_dead,
+                    response_tx,
+                },
+            ))
             .await;
 
         response_rx.await.map_err(|_| ShutdownError)
@@ -547,9 +546,8 @@ impl<T: TransportConnect> Service<T> {
     /// target node is chosen by the operator: only that node's copy is affected.
     fn spawn_drop_partition_store_task(
         &self,
-        partition_id: PartitionId,
         node_id: PlainNodeId,
-        force: bool,
+        request: DropPartitionStoreRequest,
         response_tx: oneshot::Sender<
             Result<DropPartitionStoreOutcome, DropPartitionStoreRequestError>,
         >,
@@ -571,11 +569,8 @@ impl<T: TransportConnect> Service<T> {
             TaskKind::Disposable,
             "drop-partition-store-response",
             async move {
-                let _ = response_tx.send(
-                    node_rpc_client
-                        .drop_partition_store(node_id, partition_id, force)
-                        .await,
-                );
+                let _ =
+                    response_tx.send(node_rpc_client.drop_partition_store(node_id, request).await);
                 Ok(())
             },
         );
@@ -619,18 +614,11 @@ impl<T: TransportConnect> Service<T> {
                 );
             }
             ClusterControllerCommand::DropPartitionStore {
-                partition_id,
                 node_id,
-                force,
+                request,
                 response_tx,
             } => {
-                warn!(
-                    ?partition_id,
-                    %node_id,
-                    %force,
-                    "Drop partition store command received"
-                );
-                self.spawn_drop_partition_store_task(partition_id, node_id, force, response_tx);
+                self.spawn_drop_partition_store_task(node_id, request, response_tx);
             }
             ClusterControllerCommand::UpdateClusterConfiguration {
                 partition_replication,
@@ -744,6 +732,21 @@ impl<T: TransportConnect> Service<T> {
                 }
                 ClusterControllerState::Follower => {
                     let _ = response_tx.send(Err(anyhow!("Not the cluster controller leader")));
+                }
+            },
+            ClusterControllerCommand::CheckClusterSafety(request) => match state {
+                ClusterControllerState::Leader(leader) => {
+                    if let Err(err) = leader.safety_check_tx().try_send(request) {
+                        let _ = err
+                            .into_inner()
+                            .response_tx
+                            .send(Err(anyhow!("Scheduler task is busy or not running")));
+                    }
+                }
+                ClusterControllerState::Follower => {
+                    let _ = request
+                        .response_tx
+                        .send(Err(anyhow!("Not the cluster controller leader")));
                 }
             },
         }
@@ -889,21 +892,12 @@ where
     pub async fn drop_partition_store(
         &self,
         node_id: GenerationalNodeId,
-        partition_id: PartitionId,
-        force: bool,
+        request: DropPartitionStoreRequest,
     ) -> Result<DropPartitionStoreOutcome, DropPartitionStoreRequestError> {
+        let sort_code = Some(request.partition_id.into());
         let response = self
             .network_sender
-            .call_rpc(
-                node_id,
-                Swimlane::default(),
-                DropPartitionStoreRequest {
-                    partition_id,
-                    force,
-                },
-                Some(partition_id.into()),
-                None,
-            )
+            .call_rpc(node_id, Swimlane::default(), request, sort_code, None)
             .await
             .map_err(|error| DropPartitionStoreRequestError::Rpc { node_id, error })?;
 
@@ -1186,7 +1180,7 @@ pub fn build_new_replicated_loglet_configuration(
 
 #[cfg(test)]
 mod tests {
-    use super::Service;
+    use std::sync::Arc;
 
     use googletest::assert_that;
     use googletest::matchers::eq;
@@ -1196,12 +1190,15 @@ mod tests {
     use restate_bifrost::{BifrostService, ErrorRecoveryStrategy};
     use restate_core::network::NetworkServerBuilder;
     use restate_core::{TaskCenter, TaskKind, TestCoreEnvBuilder};
+    use restate_storage_query_api::QueryEngine;
     use restate_types::config::{self, Configuration};
     use restate_types::health::HealthStatus;
     use restate_types::live::Live;
     use restate_types::logs::{LogId, Lsn, SequenceNumber};
     use restate_types::net::listener::AddressBook;
     use restate_types::partitions::state::PartitionReplicaSetStates;
+
+    use super::{ClusterStateRefresher, Service};
 
     #[test(restate_core::test)]
     async fn manual_log_trim() -> anyhow::Result<()> {
@@ -1223,8 +1220,9 @@ mod tests {
             builder.networking.clone(),
             &mut NetworkServerBuilder::new(&mut address_book),
             builder.metadata_writer.clone(),
-        )
-        .await?;
+            ClusterStateRefresher::new(builder.networking.clone()),
+            Arc::new(QueryEngine::default()),
+        );
 
         let svc_handle = svc.handle();
 

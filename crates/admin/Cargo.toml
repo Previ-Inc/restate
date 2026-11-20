@@ -34,12 +34,13 @@ restate-metadata-providers = { workspace = true }
 restate-serde-util = { workspace = true }
 restate-service-client = { workspace = true }
 restate-service-protocol-v4 = { workspace = true, features = ["discovery", "serdes"] }
+restate-storage-query-api = { workspace = true }
 restate-storage-query-datafusion = { workspace = true }
 restate-util-time = { workspace = true }
 restate-types = { workspace = true }
 restate-util-string = { workspace = true }
 restate-wal-protocol = { workspace = true }
-restate-web-ui = { git = "https://github.com/restatedev/restate-web-ui-crate", optional = true, version = "1.1.3", tag = "v1.1.3" }
+restate-web-ui = { git = "https://github.com/restatedev/restate-web-ui-crate", optional = true, version = "1.1.6", tag = "v1.1.6" }
 
 ahash = { workspace = true }
 anyhow = { workspace = true }
@@ -70,7 +71,7 @@ serde_with = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true, features = ["transport", "codegen", "gzip", "zstd"] }
-tower = { workspace = true, features = ["load-shed", "limit"] }
+tower = { workspace = true, features = ["load-shed", "limit", "util"] }
 tower-http = { workspace = true, features = ["compression-br", "compression-gzip", "compression-zstd", "trace"] }
 tracing = { workspace = true }
 urlencoding = { workspace = true }
@@ -78,6 +79,8 @@ utoipa = { workspace = true, features = ["axum_extras"] }
 utoipa-axum = { workspace = true }
 
 [dev-dependencies]
+restate-distributed-datafusion = { workspace = true, features = ["test-util"] }
+restate-storage-query-datafusion = { workspace = true, features = ["test-util"] }
 restate-bifrost = { workspace = true, features = ["test-util"] }
 restate-core = { workspace = true, features = ["test-util"] }
 restate-types = { workspace = true, features = ["test-util"] }

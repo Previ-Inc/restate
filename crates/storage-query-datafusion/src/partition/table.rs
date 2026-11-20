@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::catalog::TableProvider;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchReceiverStream;
@@ -21,26 +22,36 @@ use restate_core::Metadata;
 use restate_types::partition_table::PartitionTable;
 use restate_types::partitions::state::PartitionReplicaSetStates;
 
-use crate::context::QueryContext;
 use crate::table_providers::{GenericTableProvider, Scan};
 use crate::table_util::Builder;
 
 use super::row::append_partition_row;
-use super::schema::PartitionBuilder;
+use super::schema::{PartitionBuilder, PartitionTable as PartitionQueryTable};
 
-pub fn register_self(
-    ctx: &QueryContext,
+impl PartitionQueryTable {
+    pub(crate) fn create_provider(
+        metadata: Metadata,
+        replica_set_states: PartitionReplicaSetStates,
+    ) -> Arc<dyn TableProvider> {
+        let partitions_table = GenericTableProvider::new(
+            PartitionBuilder::schema(),
+            create_scanner(metadata, replica_set_states),
+        );
+        Arc::new(partitions_table)
+    }
+}
+
+/// The scanner of `partitions`: one row per partition in this node's partition
+/// table, with the leader and memberships this node has observed. Shared with
+/// the V2 engine.
+pub fn create_scanner(
     metadata: Metadata,
     replica_set_states: PartitionReplicaSetStates,
-) -> datafusion::common::Result<()> {
-    let partitions_table = GenericTableProvider::new(
-        PartitionBuilder::schema(),
-        Arc::new(PartitionScanner {
-            metadata,
-            replica_set_states,
-        }),
-    );
-    ctx.register_non_partitioned_table("partitions", Arc::new(partitions_table))
+) -> Arc<dyn Scan> {
+    Arc::new(PartitionScanner {
+        metadata,
+        replica_set_states,
+    })
 }
 
 #[derive(Clone, derive_more::Debug)]

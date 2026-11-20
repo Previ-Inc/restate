@@ -1,0 +1,137 @@
+// Copyright (c) 2023 - 2026 Restate Software, Inc., Restate GmbH.
+// All rights reserved.
+//
+// Use of this software is governed by the Business Source License
+// included in the LICENSE file.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0.
+
+use restate_core::{Metadata, TaskCenter};
+use restate_types::cluster_state::ClusterState;
+use restate_types::partitions::state::PartitionReplicaSetStates;
+
+use crate::BuildError;
+use crate::source_registry::SourceRegistry;
+use crate::tables::bifrost_read_stream::BifrostReadStreamsTable;
+use crate::tables::config::ConfigTable;
+use crate::tables::loglet_workers::LogletWorkersTable;
+use crate::tables::logs::LogsTable;
+use crate::tables::migration_records::{MigrationJobsTable, RegistryTable};
+use crate::tables::nodes::NodesTable;
+use crate::tables::partition_replica_set::PartitionReplicaSetTable;
+use crate::tables::partition_state::PartitionStateTable;
+use crate::tables::partitions::PartitionsTable;
+
+use super::{RegisterTable, TableInventoryBuilder};
+
+/// Registers V2's cluster tables, including coordinator-local observations.
+pub struct ClusterTables {
+    sources: SourceRegistry,
+    /// This node's gossip view of the cluster.
+    cluster_state: ClusterState,
+    /// The partition memberships and leaders this node has observed.
+    replica_set_states: PartitionReplicaSetStates,
+}
+
+impl ClusterTables {
+    /// `replica_set_states` are this node's observed partition memberships, the
+    /// same the default engine's cluster tables read.
+    pub fn new(sources: SourceRegistry, replica_set_states: PartitionReplicaSetStates) -> Self {
+        Self {
+            sources,
+            cluster_state: TaskCenter::with_current(|tc| tc.cluster_state().clone()),
+            replica_set_states,
+        }
+    }
+}
+
+impl RegisterTable for ClusterTables {
+    async fn register(&self, inventory: &mut TableInventoryBuilder<'_>) -> Result<(), BuildError> {
+        inventory.add::<NodesTable>(
+            "cluster",
+            "nodes",
+            NodesTable::create_provider(Metadata::current(), self.cluster_state.clone()),
+        )?;
+        inventory.add::<PartitionsTable>(
+            "cluster",
+            "partitions",
+            PartitionsTable::create_provider(Metadata::current(), self.replica_set_states.clone()),
+        )?;
+        inventory.add::<PartitionReplicaSetTable>(
+            "cluster",
+            "partition_replica_set",
+            PartitionReplicaSetTable::create_provider(
+                Metadata::current(),
+                self.cluster_state.clone(),
+                self.replica_set_states.clone(),
+            ),
+        )?;
+        inventory.add::<LogsTable>(
+            "cluster",
+            "logs",
+            LogsTable::create_provider(Metadata::current()),
+        )?;
+        // Each log's last segment, as in V1.
+        inventory
+            .add_view(
+                "logs_tail_segments",
+                "cluster",
+                include_str!("logs_tail_segments.sql"),
+            )
+            .await?;
+        // Workers register their reports separately
+        // (`local_scanners::register_partition_state_reports`).
+        inventory.add::<PartitionStateTable>(
+            "cluster",
+            "partition_state",
+            PartitionStateTable::create_provider(
+                Metadata::current(),
+                self.sources.clone(),
+                self.cluster_state.clone(),
+                self.replica_set_states.clone(),
+            ),
+        )?;
+        inventory.add::<LogletWorkersTable>(
+            "cluster",
+            "loglet_workers",
+            LogletWorkersTable::create_provider(
+                Metadata::current(),
+                self.sources.clone(),
+                None, // Log servers register their local scanner separately.
+            ),
+        )?;
+        inventory.add::<BifrostReadStreamsTable>(
+            "cluster",
+            "bifrost_read_streams",
+            BifrostReadStreamsTable::create_provider(
+                Metadata::current(),
+                self.sources.clone(),
+                None, // The node registers its local scanner separately.
+            ),
+        )?;
+        // Admin `/query` sessions exclude `config`; `restatectl sql` (gRPC) serves it.
+        inventory.add::<ConfigTable>(
+            "cluster",
+            "config",
+            ConfigTable::create_provider(
+                Metadata::current(),
+                self.sources.clone(),
+                None, // The node registers its local scanner separately.
+            ),
+        )?;
+        // Worker nodes register their scanners of these separately
+        // (`local_scanners::register_cluster_scanners`).
+        inventory.add::<RegistryTable>(
+            "cluster",
+            "registry",
+            RegistryTable::create_provider(Metadata::current(), self.sources.clone()),
+        )?;
+        inventory.add::<MigrationJobsTable>(
+            "cluster",
+            "migration_jobs",
+            MigrationJobsTable::create_provider(Metadata::current(), self.sources.clone()),
+        )
+    }
+}

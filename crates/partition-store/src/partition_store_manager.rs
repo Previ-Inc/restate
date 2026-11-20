@@ -14,16 +14,18 @@ use std::time::Duration;
 
 use ahash::HashMap;
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use tokio_util::sync::CancellationToken;
-use tracing::{Level, debug, error, info, instrument, warn};
+use tracing::{Level, debug, error, field, info, instrument, warn};
 
+use restate_core::io::IdleTracker;
 use restate_futures_util::overdue::OverdueLoggingExt;
+use restate_memory::ByteCount;
 use restate_rocksdb::{
     CfPrefixPattern, DbRef, DbSpecBuilder, RocksDb, RocksDbManager, RocksError, SinglePoolExecutor,
 };
 use restate_storage_api::fsm_table::ReadFsmTable;
-use restate_types::config::Configuration;
+use restate_types::config::{Configuration, RocksDbCompaction};
 use restate_types::identifiers::{PartitionId, SnapshotId};
 use restate_types::logs::{Lsn, SequenceNumber};
 use restate_types::partitions::Partition;
@@ -33,7 +35,8 @@ use crate::SnapshotError;
 use crate::durable_lsn_tracking::DurableLsnSenders;
 use crate::memory::MemoryController;
 use crate::partition_db::{
-    AllDataCf, PartitionCell, PartitionDb, PartitionStoreDb, RocksConfigurator, State,
+    AllDataCf, DroppedPartitionStore, PartitionCell, PartitionDb, PartitionStoreDb,
+    RocksConfigurator, State,
 };
 use crate::snapshots::{
     CommitFenceRequest, LocalPartitionSnapshot, PartitionSnapshotStatus, Snapshots,
@@ -47,11 +50,11 @@ const LOG_SLOW_TRANSITION_AFTER: Duration = Duration::from_secs(5);
 
 pub(crate) struct SharedState {
     partitions: RwLock<HashMap<PartitionId, Arc<PartitionCell>>>,
-    executor: SinglePoolExecutor,
+    executor: IdleTracker<SinglePoolExecutor>,
 }
 
 impl SharedState {
-    fn new(executor: SinglePoolExecutor) -> Self {
+    fn new(executor: IdleTracker<SinglePoolExecutor>) -> Self {
         Self {
             partitions: Default::default(),
             executor,
@@ -134,6 +137,8 @@ pub struct PartitionStoreManager {
     db_cache: AsyncMutex<HashMap<restate_rocksdb::DbName, CachedDb>>,
     memory_controller: MemoryController,
     use_multi_db_layout: bool,
+    /// Read once, when the node starts: changing the compaction takes a restart.
+    compaction: RocksDbCompaction,
 }
 
 impl PartitionStoreManager {
@@ -144,7 +149,8 @@ impl PartitionStoreManager {
         // Partition creation, import, and deletion share the RocksDB lifecycle pool.
         let executor = RocksDbManager::get().lifecycle_executor().clone();
         let state = Arc::new(SharedState::new(executor));
-        let memory_controller = MemoryController::start(state.clone())?;
+        let compaction = Configuration::pinned().worker.storage.rocksdb_compaction();
+        let memory_controller = MemoryController::start(state.clone(), compaction)?;
 
         let psm = Arc::new(Self {
             state: state.clone(),
@@ -154,6 +160,7 @@ impl PartitionStoreManager {
             db_cache: Default::default(),
             memory_controller,
             use_multi_db_layout,
+            compaction,
         });
 
         Ok(psm)
@@ -196,6 +203,7 @@ impl PartitionStoreManager {
             self.memory_controller.memory_budget.clone(),
             &notifications,
             self.use_multi_db_layout,
+            self.compaction,
         );
 
         let db_spec = DbSpecBuilder::new(
@@ -281,6 +289,16 @@ impl PartitionStoreManager {
         }
     }
 
+    /// The databases of the partitions open on this node, skipping any in the
+    /// middle of opening or closing.
+    pub(crate) fn open_partition_dbs(&self) -> Vec<PartitionDb> {
+        self.state
+            .get_maybe_open_dbs()
+            .iter()
+            .filter_map(|state| state.db().cloned())
+            .collect()
+    }
+
     /// Returns a partition db that's already open by a running partition processor
     pub async fn get_partition_db(&self, partition_id: PartitionId) -> Option<PartitionDb> {
         // note: we don't hold the map read lock while trying to acquire the partition cell's lock.
@@ -298,6 +316,13 @@ impl PartitionStoreManager {
         // hence the `cloned()` call.
         let cell = self.state.partitions.read().get(&partition_id).cloned()?;
         cell.get_partition_if_open().await
+    }
+
+    /// The faults of `partition`, which all its openings share. Arming one before the
+    /// partition opens applies to its first opening.
+    #[cfg(any(test, feature = "faults"))]
+    pub fn faults(&self, partition: &Partition) -> crate::faults::Faults {
+        self.state.get_or_default(partition).faults.clone()
     }
 
     /// Returns a partition store that's already open by a running partition processor
@@ -358,59 +383,58 @@ impl PartitionStoreManager {
         // target-lsn target higher than our local state (probably due to seeing a log trim-gap).
         // **
 
-        // Attempt to get the latest available snapshot from the snapshot repository:
-        let snapshot = match self
+        // Attempt to get a suitable snapshot from the repository:
+        let snapshot_result = self
             .snapshots
-            .download_latest_snapshot(partition.partition_id, cancellation)
-            .await
-        {
-            Ok(snapshot) => snapshot,
-            Err(_) if cancellation.is_cancelled() => return Err(OpenError::Cancelled),
-            Err(err) => return Err(OpenError::Snapshot(err)),
-        };
+            .download_snapshot(partition.partition_id, target_lsn, cancellation)
+            .await;
+        if snapshot_result.is_err() && cancellation.is_cancelled() {
+            return Err(OpenError::Cancelled);
+        }
 
-        match (snapshot, target_lsn) {
-            (None, None) => {
-                debug!("No snapshot found for partition, creating new partition store");
-                let db = cell.provision(&mut state_guard, database).await?;
-                Ok(PartitionStore::from(db))
-            }
-
-            (Some(snapshot), None) => {
+        match (snapshot_result, target_lsn) {
+            (Ok(Some(snapshot)), None) => {
                 info!("Found partition snapshot, restoring it");
                 let db = cell.import_cf(&mut state_guard, snapshot, database).await?;
-
                 Ok(PartitionStore::from(db))
             }
 
-            // Good snapshot
-            (Some(snapshot), Some(fast_forward_lsn))
-                if snapshot.min_applied_lsn >= fast_forward_lsn =>
-            {
+            (Ok(Some(snapshot)), Some(fast_forward_lsn)) => {
+                // Got a snapshot that meets the target LSN requirement (filtered by candidate LSN
+                // and re-verified against the downloaded metadata in `download_snapshot`).
                 info!(
-                    latest_snapshot_lsn = %snapshot.min_applied_lsn,
+                    snapshot_lsn = %snapshot.min_applied_lsn,
                     %fast_forward_lsn,
                     "Found snapshot with LSN >= target LSN, dropping local partition store state",
                 );
                 let db = cell.import_cf(&mut state_guard, snapshot, database).await?;
                 Ok(PartitionStore::from(db))
             }
-            (maybe_snapshot, Some(fast_forward_lsn)) => {
-                // Play it safe and keep the partition store intact; we can't do much else at this
-                // point. We'll likely halt again as soon as the processor starts up.
+
+            (Ok(None), None) => {
+                debug!("No snapshot found for partition, creating new partition store");
+                let db = cell.provision(&mut state_guard, database).await?;
+                Ok(PartitionStore::from(db))
+            }
+
+            (Err(err), _) => {
+                // A snapshot may well exist but we failed to fetch it (transient repository error,
+                // or every retained candidate failed to download). Do NOT provision an empty store
+                // and silently discard data; fail the open so the processor retries later.
+                Err(OpenError::Snapshot(err))
+            }
+
+            // We required a snapshot (fast-forward target) but none exists at or above the
+            // target LSN.
+            (Ok(None), Some(fast_forward_lsn)) => {
                 let recovery_guide_msg = "The partition's log is trimmed to a point from which this processor can not resume. \
                 Visit https://docs.restate.dev/server/clusters#handling-missing-snapshots \
                 to learn more about how to recover this processor.";
 
-                if let Some(snapshot) = maybe_snapshot {
-                    warn!(
-                        latest_snapshot_lsn = %snapshot.min_applied_lsn,
-                        %fast_forward_lsn,
-                        "The latest available snapshot is from an LSN before the target LSN! {}",
-                        recovery_guide_msg,
-                    );
-                    Err(OpenError::SnapshotUnsuitable)
-                } else if !self.snapshots.is_repository_configured() {
+                metrics::counter!(crate::metric_definitions::SNAPSHOT_FAST_FORWARD_FAILED)
+                    .increment(1);
+
+                if !self.snapshots.is_repository_configured() {
                     error!(
                         %fast_forward_lsn,
                         "A log trim gap was encountered, but no snapshot repository is configured! {}",
@@ -420,7 +444,7 @@ impl PartitionStoreManager {
                 } else {
                     error!(
                         %fast_forward_lsn,
-                        "A log trim gap was encountered, but no snapshot is available for this partition! {}",
+                        "A log trim gap was encountered, but no suitable snapshot is available for this partition! {}",
                         recovery_guide_msg,
                     );
                     Err(OpenError::SnapshotRequired)
@@ -512,9 +536,8 @@ impl PartitionStoreManager {
     }
 
     /// Deletes this node's local copy of the partition, discarding all of its data.
-    /// Returns `true` if there was a column family to delete, `false` if there was
-    /// nothing to delete. It also finds a column family that this process hasn't
-    /// opened yet.
+    /// Returns what was deleted, or `None` if there was nothing to delete. It also finds
+    /// a column family that this process hasn't opened yet.
     ///
     /// The partition stops accepting work right away, and its column family is deleted
     /// once nothing uses it anymore. So this waits until every [`PartitionStore`] and
@@ -524,7 +547,10 @@ impl PartitionStoreManager {
     /// the deletion goes ahead even if this call is cancelled. If an earlier deletion
     /// failed, this retries it.
     #[instrument(level = "error", skip_all, fields(partition_id = %partition.partition_id, cf_name = %partition.cf_name()))]
-    pub async fn drop_partition_store(&self, partition: &Partition) -> Result<bool, RocksError> {
+    pub async fn drop_partition_store(
+        &self,
+        partition: &Partition,
+    ) -> Result<Option<DroppedPartitionStore>, RocksError> {
         let dropped = async {
             let database = self.open_rocksdb(partition).await?;
             let cell = self.state.get_or_default(partition);
@@ -541,12 +567,40 @@ impl PartitionStoreManager {
         )
         .await?;
 
-        if dropped {
-            info!("Dropped local partition store");
-        } else {
-            debug!("No local partition store to drop");
+        match dropped {
+            Some(DroppedPartitionStore { disk_usage }) => info!(
+                disk_usage = disk_usage.map(|bytes| field::display(ByteCount::from(bytes))),
+                "Dropped local partition store"
+            ),
+            None => debug!("No local partition store to drop"),
         }
         Ok(dropped)
+    }
+
+    /// Reports what [`Self::drop_partition_store`] would delete right now, without changing
+    /// anything: this node's local copy of the partition with its disk usage, or `None` if
+    /// there is no local copy.
+    #[instrument(level = "error", skip_all, fields(partition_id = %partition.partition_id, cf_name = %partition.cf_name()))]
+    pub async fn preview_drop_partition_store(
+        &self,
+        partition: &Partition,
+    ) -> Result<Option<DroppedPartitionStore>, RocksError> {
+        let database = self.open_rocksdb(partition).await?;
+        // Measure through a handle of our own, so that the partition stays as it is.
+        let Some(db) = PartitionDb::new(
+            Arc::new(partition.clone()),
+            watch::Sender::new(None),
+            database,
+            Default::default(),
+        ) else {
+            return Ok(None);
+        };
+        let disk_usage = db
+            .disk_usage()
+            .await
+            .inspect_err(|error| warn!(%error, "Could not measure the partition store"))
+            .ok();
+        Ok(Some(DroppedPartitionStore { disk_usage }))
     }
 
     /// Opens a partition store by importing an already-downloaded snapshot, discarding any
@@ -611,12 +665,59 @@ mod tests {
     use crate::keys::KeyKind;
     use crate::partition_db::{PartitionCell, State};
     use crate::snapshots::{CaptureGuard, CommitFenceRequest};
-    use crate::{PartitionStore, PartitionStoreTransaction, SnapshotErrorKind};
+    use crate::{
+        DroppedPartitionStore, PartitionStore, PartitionStoreTransaction, SnapshotErrorKind,
+    };
 
     async fn write_applied_lsn(store: &mut PartitionStore, lsn: u64) -> anyhow::Result<()> {
         let mut tx = store.transaction();
         tx.put_applied_lsn(Lsn::new(lsn))?;
         tx.commit().await?;
+        Ok(())
+    }
+
+    #[restate_core::test]
+    async fn disk_usage_matches_live_files_also_when_closed() -> anyhow::Result<()> {
+        const DEADLINE: Duration = Duration::from_secs(10);
+        let rocksdb = RocksDbManager::init();
+        let partition = Partition::new(PartitionId::MIN, KeyRange::FULL);
+        let sibling = Partition::new(PartitionId::from(1), KeyRange::FULL);
+        for layout in [false, true] {
+            let manager = PartitionStoreManager::create(layout).await?;
+            let mut store = manager.open(&partition, None).await?;
+            let mut neighbor = manager.open(&sibling, None).await?;
+            let db = store.partition_db().clone();
+            assert_eq!(db.disk_usage().await?, 0, "nothing flushed yet");
+
+            // A single flush stays below the L0 compaction trigger: a background compaction
+            // would change the files between the measurements below.
+            write_applied_lsn(&mut store, 10).await?;
+            write_applied_lsn(&mut neighbor, 10).await?;
+            db.flush_memtables(true).await?;
+            neighbor.partition_db().flush_memtables(true).await?;
+            let live_files_size = db
+                .rocksdb()
+                .inner()
+                .as_raw_db()
+                .live_files()?
+                .into_iter()
+                .filter(|file| file.column_family_name == partition.cf_name().as_ref())
+                .map(|file| file.size as u64)
+                .sum::<u64>();
+            assert!(live_files_size > 0);
+            assert_eq!(
+                db.disk_usage().await?,
+                live_files_size,
+                "counts the partition's own files only"
+            );
+
+            drop(store);
+            timeout(DEADLINE, manager.close(partition.partition_id)).await?;
+            assert_eq!(db.disk_usage().await?, live_files_size);
+
+            drop((db, neighbor, manager));
+            rocksdb.reset().await?;
+        }
         Ok(())
     }
 
@@ -820,11 +921,27 @@ mod tests {
             rocksdb.reset().await?;
 
             let manager = PartitionStoreManager::create(layout).await?;
+            let preview = manager.preview_drop_partition_store(&partition).await?;
+            let dropped = manager
+                .drop_partition_store(&partition)
+                .await?
+                .expect("finds a column family this process never opened");
             assert!(
-                manager.drop_partition_store(&partition).await?,
-                "finds a column family this process never opened"
+                dropped.disk_usage.is_some_and(|size| size > 0),
+                "measures a store this process never opened"
             );
-            assert!(!manager.drop_partition_store(&partition).await?);
+            assert_eq!(
+                preview,
+                Some(dropped),
+                "a preview reports what the drop deletes, and leaves it in place"
+            );
+            assert!(manager.drop_partition_store(&partition).await?.is_none());
+            assert!(
+                manager
+                    .preview_drop_partition_store(&partition)
+                    .await?
+                    .is_none()
+            );
             let mut neighbor = manager.open(&sibling, None).await?;
             assert_eq!(neighbor.get_applied_lsn().await?, Some(Lsn::new(20)));
 
@@ -833,8 +950,9 @@ mod tests {
                 .rocksdb
                 .inner()
                 .open_cf(partition.cf_name().into())?;
-            assert!(
+            assert_eq!(
                 manager.drop_partition_store(&partition).await?,
+                Some(DroppedPartitionStore { disk_usage: None }),
                 "finds a leftover column family while the cell is CfMissing"
             );
             assert!(
@@ -853,7 +971,11 @@ mod tests {
                 assert_eq!(store.get_applied_lsn().await?, None);
                 write_applied_lsn(&mut store, 30).await?;
                 drop(store);
-                assert!(timeout(DEADLINE, manager.drop_partition_store(&partition)).await??);
+                assert!(
+                    timeout(DEADLINE, manager.drop_partition_store(&partition))
+                        .await??
+                        .is_some()
+                );
             }
             assert_eq!(neighbor.get_applied_lsn().await?, Some(Lsn::new(20)));
             drop((neighbor, manager));
@@ -929,7 +1051,7 @@ mod tests {
             ));
             assert!(has_cf());
             assert!(manager.open(&partition, None).await.is_err());
-            assert!(manager.drop_partition_store(&partition).await?);
+            assert!(manager.drop_partition_store(&partition).await?.is_some());
             assert!(!has_cf());
 
             // A slow creation doesn't hold up other partitions. A drop that comes in
@@ -957,7 +1079,7 @@ mod tests {
             );
             drop(opening);
             drop(resume);
-            assert!(timeout(DEADLINE, dropping).await??);
+            assert!(timeout(DEADLINE, dropping).await??.is_some());
             assert!(!has_cf());
             assert_eq!(neighbor.get_applied_lsn().await?, Some(Lsn::new(30)));
 

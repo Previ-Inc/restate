@@ -20,6 +20,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{Span, debug, info, info_span};
 
 use restate_admin_rest_model::version::AdminApiVersion;
+use restate_core::network::misdirected_requests::MisdirectedRequestsLayer;
 use restate_core::network::{TransportConnect, net_util};
 use restate_core::{MetadataWriter, TaskCenter};
 use restate_ingestion_client::IngestionClient;
@@ -28,7 +29,8 @@ use restate_metadata_store::MetadataStoreClient;
 use restate_service_client::HttpClient;
 use restate_service_protocol_v4::discovery::ServiceDiscovery;
 use restate_service_protocol_v4::serdes::SerdesClient;
-use restate_types::config::AdminOptions;
+use restate_storage_query_api::QueryEngine;
+use restate_types::config::{AdminOptions, Configuration};
 use restate_types::invocation::client::InvocationClient;
 use restate_types::live::LiveLoad;
 use restate_types::net::address::AdminPort;
@@ -37,6 +39,7 @@ use restate_types::schema::registry::SchemaRegistry;
 use restate_util_time::DurationExt;
 use restate_wal_protocol::v2::{Envelope, Raw};
 
+use crate::metric_definitions::describe_metrics;
 use crate::rest_api::{MAX_ADMIN_API_VERSION, MIN_ADMIN_API_VERSION};
 use crate::schema_registry_integration::{MetadataService, TelemetryClient};
 use crate::{rest_api, state};
@@ -51,7 +54,7 @@ pub struct AdminService<Metadata, Discovery, Telemetry, Invocations, Transport> 
     schema_registry: SchemaRegistry<Metadata, Discovery, Telemetry>,
     serdes_client: SerdesClient,
     invocation_client: Invocations,
-    query_context: Option<restate_storage_query_datafusion::context::QueryContext>,
+    query_engine: Arc<QueryEngine>,
     metadata_client: MetadataStoreClient,
     rule_book_observer: Option<Arc<dyn RuleBookObserver>>,
 }
@@ -62,6 +65,7 @@ where
     Invocations: InvocationClient + Send + Sync + Clone + 'static,
     Transport: TransportConnect,
 {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         listeners: Listeners<AdminPort>,
         metadata_writer: MetadataWriter,
@@ -70,7 +74,10 @@ where
         serdes_client: SerdesClient,
         service_discovery: ServiceDiscovery,
         telemetry_http_client: Option<HttpClient>,
+        query_engine: Arc<QueryEngine>,
     ) -> Self {
+        describe_metrics();
+
         let metadata_client = metadata_writer.raw_metadata_store_client().clone();
         Self {
             listeners,
@@ -82,19 +89,9 @@ where
             ),
             serdes_client,
             invocation_client,
-            query_context: None,
+            query_engine,
             metadata_client,
             rule_book_observer: None,
-        }
-    }
-
-    pub fn with_query_context(
-        self,
-        query_context: restate_storage_query_datafusion::context::QueryContext,
-    ) -> Self {
-        Self {
-            query_context: Some(query_context),
-            ..self
         }
     }
 
@@ -110,16 +107,31 @@ where
         mut updateable_config: impl LiveLoad<Live = AdminOptions>,
     ) -> anyhow::Result<()> {
         let opts = updateable_config.live_load();
+        let misdirected_requests = {
+            let config = Configuration::pinned();
+            config
+                .common
+                .reject_misdirected_requests
+                .then(|| MisdirectedRequestsLayer::new(config.common.cluster_name()))
+        };
 
-        let rest_state = state::AdminServiceState::new(
+        let mut rest_state = state::AdminServiceState::new(
             self.schema_registry,
             self.serdes_client,
             self.invocation_client,
             self.ingestion_client,
             self.metadata_client.clone(),
-            self.query_context,
+            self.query_engine,
             self.rule_book_observer,
         );
+        rest_state.query_engine_v2_default = Configuration::pinned()
+            .common
+            .experimental
+            .is_query_engine_v2_default_enabled();
+        rest_state.query_operator_tables = Configuration::pinned()
+            .common
+            .experimental
+            .is_query_operator_tables_enabled();
 
         let router = axum::Router::new();
 
@@ -220,7 +232,10 @@ where
                     )),
             );
 
-        let service = hyper_util::service::TowerToHyperService::new(router.into_service());
+        let router = ServiceBuilder::new()
+            .option_layer(misdirected_requests)
+            .service(router.into_service());
+        let service = hyper_util::service::TowerToHyperService::new(router);
 
         info!(
             "Admin API starting on: {}",

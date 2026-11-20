@@ -1,0 +1,267 @@
+// Copyright (c) 2023 - 2026 Restate Software, Inc., Restate GmbH.
+// All rights reserved.
+//
+// Use of this software is governed by the Business Source License
+// included in the LICENSE file.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Result;
+use cling::prelude::*;
+use futures::{FutureExt, StreamExt};
+use itertools::Itertools;
+use remote::RemotePort;
+use tokio_util::sync::CancellationToken;
+
+use restate_cli_util::CliContext;
+
+use crate::cli_env::EnvironmentType;
+use crate::clients::cloud::{CloudClient, CloudClientInterface};
+use crate::error::RestateCliError;
+use crate::{build_info, cli_env::CliEnv};
+
+use super::deployment_name::default_deployment_name;
+
+mod local;
+mod remote;
+mod renderer;
+
+/// Tunnel local ports to and from a Cloud environment (runs until interrupted)
+///
+/// For services that can't connect by themselves, or to expose any local port. Uses the
+/// current profile (or -p), which must be a Cloud one. Exposes the environment's ports
+/// (ingress 8080, admin 9070) on localhost, and lets the environment call services running
+/// on this machine: register them with `restate deployments register --tunnel-name <name>
+/// http://localhost:9080` (your service's URL). By default, all remote ports are exposed and
+/// inbound calls are allowed.
+#[derive(Run, Parser, Collect, Clone)]
+#[cling(run = "run_tunnel")]
+#[clap(alias = "tun")]
+#[command(after_help = after_help!(
+    examples: [
+        "restate cloud tunnel",
+        "restate cloud tunnel --name greeter-dev --no-remote-ports",
+    ],
+    learn_more: "https://docs.restate.dev/cloud/getting-started",
+))]
+pub struct Tunnel {
+    /// Only expose remote ports: block calls from the Cloud environment to this machine
+    #[clap(long = "no-local")]
+    no_inbound: bool,
+
+    /// Remote port of the environment to expose on localhost. Repeat for several ports; by
+    /// default all of them are exposed
+    #[clap(short = 'r', long, action = clap::ArgAction::Append, conflicts_with = "no_remote_ports")]
+    remote_port: Vec<remote::RemotePort>,
+
+    /// Only accept calls from the Cloud environment: expose none of its ports on localhost
+    #[clap(long)]
+    no_remote_ports: bool,
+
+    /// Name of the tunnel, to pass to `restate deployments register --tunnel-name`. Letters,
+    /// digits, `.`, `_` and `-`. Default: `<directory>-<hostname>`, stable across restarts
+    #[clap(long = "name", alias = "tunnel-name", value_name = "NAME")]
+    tunnel_name: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum Error {
+    #[error(transparent)]
+    Local(#[from] restate_cloud_tunnel_client::client::ServeError),
+    #[error(transparent)]
+    Remote(#[from] remote::ServeError),
+    #[error("Ctrl-C pressed")]
+    ControlC,
+}
+
+pub async fn run_tunnel(State(env): State<CliEnv>, opts: &Tunnel) -> Result<()> {
+    let environment_info = match (
+        &env.config.environment_type,
+        &env.config.cloud.environment_info,
+    ) {
+        (EnvironmentType::Cloud, Some(environment_info)) => environment_info,
+        _ => {
+            return Err(RestateCliError::bad_input(format!(
+                "The current profile \"{}\" is not a Restate Cloud environment",
+                env.profile
+            ))
+            .with_next_step("restate profile use", "switch to a Cloud profile")
+            .with_unformatted_next_step("restate cloud login", "import Cloud profiles")
+            .into());
+        }
+    };
+
+    let bearer_token = match &env.config.bearer_token {
+        // the user may have specifically set an api token
+        Some(bearer_token) => bearer_token.clone(),
+        None => env.cloud_access_token()?.to_owned(),
+    };
+
+    let mut opts = opts.clone();
+    if !opts.no_remote_ports && opts.remote_port.is_empty() {
+        opts.remote_port = vec![RemotePort::Ingress, RemotePort::Admin];
+    }
+
+    let client = CloudClient::new(&env)?;
+
+    let environment_info = client
+        .describe_environment(
+            &environment_info.account_id,
+            &environment_info.environment_id,
+        )
+        .await?
+        .into_body()
+        .await?;
+
+    let user_agent = format!(
+        "{}/{} {}-{}",
+        env!("CARGO_PKG_NAME"),
+        build_info::RESTATE_CLI_VERSION,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    );
+
+    let connect_timeout = CliContext::get().connect_timeout();
+
+    let alpn_client = reqwest::Client::builder()
+        .user_agent(user_agent.clone())
+        .connect_timeout(connect_timeout)
+        .build()?;
+
+    let h2_client = reqwest::Client::builder()
+        .user_agent(user_agent.clone())
+        .connect_timeout(connect_timeout)
+        .http2_prior_knowledge()
+        .build()?;
+
+    let h1_client = reqwest::Client::builder()
+        .user_agent(user_agent)
+        .connect_timeout(connect_timeout)
+        .http1_only()
+        .build()?;
+
+    let cancellation = CancellationToken::new();
+
+    // prevent ctrl-c from clearing the screen, instead just cancel
+    {
+        let cancellation = cancellation.clone();
+        let boxed: Box<dyn Fn() + Send> = Box::new(move || cancellation.cancel());
+        *crate::EXIT_HANDLER.lock().unwrap() = Some(boxed);
+    }
+
+    let tunnel_name = opts
+        .tunnel_name
+        .clone()
+        .unwrap_or_else(default_deployment_name);
+
+    let tunnel_renderer = Arc::new(
+        renderer::TunnelRenderer::new(
+            tunnel_name.clone(),
+            environment_info.name.clone(),
+            &opts.remote_port,
+        )
+        .unwrap(),
+    );
+
+    let local_fut = local::run_local(
+        opts.no_inbound,
+        alpn_client,
+        h1_client.clone(),
+        h2_client.clone(),
+        &bearer_token,
+        environment_info,
+        tunnel_name.clone(),
+        tunnel_renderer.clone(),
+    );
+
+    let remote_futs = futures::stream::FuturesUnordered::new();
+    for remote_port in &opts.remote_port {
+        let base_url = match remote_port {
+            remote::RemotePort::Ingress => {
+                let advertised_address = env.ingress_base_url()?.clone().into_address()?;
+                if advertised_address.is_unix_domain_socket() {
+                    return Err(anyhow::anyhow!(
+                        "Cannot tunnel to an ingress server running on a unix domain socket"
+                    ));
+                }
+                advertised_address.to_string()
+            }
+            remote::RemotePort::Admin => {
+                let advertised_address = env.admin_base_url()?.clone().into_address()?;
+                if advertised_address.is_unix_domain_socket() {
+                    return Err(anyhow::anyhow!(
+                        "Cannot tunnel to an admin server running on a unix domain socket"
+                    ));
+                }
+                advertised_address.to_string()
+            }
+        }
+        .parse()?;
+
+        remote_futs.push(remote::run_remote(
+            *remote_port,
+            h2_client.clone(),
+            base_url,
+            &bearer_token,
+            tunnel_renderer.clone(),
+        ));
+    }
+
+    let mut rerender = tokio::time::interval(Duration::from_millis(100));
+
+    let res = {
+        let local_fut = local_fut.fuse();
+        tokio::pin!(local_fut);
+        let mut remote_futs = remote_futs;
+
+        loop {
+            tokio::select! {
+                Err(local_err) = &mut local_fut => break Err(Error::Local(local_err)),
+                Some(Err(remote_err)) = remote_futs.next() => break Err(Error::Remote(remote_err)),
+                _ = cancellation.cancelled() => break Err(Error::ControlC),
+                _ = rerender.tick() => {
+                    tunnel_renderer.render();
+                },
+            }
+        }
+    };
+
+    if let Some(renderer) = Arc::into_inner(tunnel_renderer)
+        && renderer
+            .local
+            .target_connected
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != 0
+    {
+        // dropping the renderer will exit the alt screen
+        drop(renderer);
+        let remote_ports = if opts.remote_port.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " --remote-port {}",
+                opts.remote_port
+                    .iter()
+                    .map(|port| u16::from(*port))
+                    .join(" --remote-port ")
+            )
+        };
+        eprintln!(
+            "To retry with the same tunnel name:\nrestate cloud tunnel --name {tunnel_name}{remote_ports}"
+        );
+    };
+
+    match res {
+        Err(Error::ControlC) => {
+            eprintln!("Exiting as Ctrl-C pressed");
+            Ok(())
+        }
+        Ok(()) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}

@@ -1,0 +1,36 @@
+# Release Notes: Records of background migrations
+
+## New Feature
+
+### What Changed
+Each partition replica now keeps a record of its background migrations, the
+backfills that build query indexes and statistics. A record shows when the
+migration was created, started and finished, how many entries it examined and
+changed, how much work time it took, and its failures with the last error.
+Unfinished migrations are always recorded. Finished ones are kept for a
+while, set by a new option under `[worker.storage]`:
+
+- `finished-migration-jobs-retention` (default `24h`): how long each partition
+  replica keeps the record of a finished migration. A record expires this long
+  after its migration finished, using the value configured at that moment, and
+  is then no longer shown. `0` keeps none.
+
+The option takes effect when partitions open.
+
+### Why This Matters
+Operators need to see how an index or statistic build is going, whether it is
+stuck, and what it did once it finished.
+
+### Impact on Users
+- Records of unfinished migrations are always kept, so a stuck or failing
+  backfill stays visible until it finishes.
+- The records are diagnostics only: they never decide whether an index can be
+  read, and losing them, for example after a downgrade, loses no data.
+
+### Migration Guidance
+No action needed. To keep finished migrations for a week, for example:
+
+```toml
+[worker.storage]
+finished-migration-jobs-retention = "7d"
+```

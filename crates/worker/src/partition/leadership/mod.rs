@@ -41,7 +41,6 @@ use restate_storage_api::deduplication_table::EpochSequenceNumber;
 use restate_storage_api::outbox_table::{OutboxMessage, ReadOutboxTable};
 use restate_storage_api::timer_table::{ReadTimerTable, TimerKey};
 use restate_timer::TokioClock;
-use restate_types::GenerationalNodeId;
 use restate_types::cluster::cluster_state::RunMode;
 use restate_types::config::Configuration;
 use restate_types::errors::GenericError;
@@ -57,6 +56,7 @@ use restate_types::partitions::PartitionFeatureChange;
 use restate_types::protobuf::cluster::DetailedRunMode;
 use restate_types::schema::Schema;
 use restate_types::storage::{StorageDecodeError, StorageEncodeError};
+use restate_types::{GenerationalNodeId, RESTATE_VERSION_1_9_0, SemanticRestateVersion};
 use restate_util_string::format_restring;
 use restate_util_time::DurationExt;
 use restate_vqueues::context::{HasVQueues, HasVQueuesMut};
@@ -231,6 +231,17 @@ where
 
     pub(crate) fn is_leader(&self) -> bool {
         matches!(self.state, State::Leader(_) | State::BecomingLeader { .. })
+    }
+
+    /// Whether query reads that need the leader can be admitted: only once this
+    /// processor is the leader, since live state exists only then.
+    pub(crate) fn query_leading(&self) -> crate::partition::query_reads::Leading {
+        use crate::partition::query_reads::Leading;
+        match self.state {
+            State::Leader(_) => Leading::Yes,
+            State::BecomingLeader { .. } => Leading::Becoming,
+            State::Follower | State::Candidate { .. } => Leading::No,
+        }
     }
 
     /// Returns the [`LeaderContext`] if this processor is the (becoming) leader.
@@ -605,6 +616,20 @@ where
                 feature_changes.push(PartitionFeatureChange::EnablePreflightSignalRecording);
             }
 
+            // On by default from v1.9.0, including development and release-candidate builds, once
+            // every worker runs it: until then, the cluster can still roll back to any v1.8.x.
+            let byte_offsets_by_default = SemanticRestateVersion::current()
+                .release_is_equal_or_newer_than(&RESTATE_VERSION_1_9_0)
+                && Metadata::with_current(|m| {
+                    m.nodes_config_ref()
+                        .all_workers_run_at_least(&RESTATE_VERSION_1_9_0)
+                });
+            if (byte_offsets_by_default || config.common.experimental.is_byte_offsets_enabled())
+                && !processor.fsm().features().is_byte_offsets_enabled()
+            {
+                feature_changes.push(PartitionFeatureChange::EnableByteOffsets);
+            }
+
             if !feature_changes.is_empty() {
                 // Smallest version that supports every listed feature, but never below
                 // the partition's current min_restate_version.
@@ -666,11 +691,20 @@ where
             let (invoker_tx, invoker_rx) = mpsc::channel(config.worker.internal_queue_length());
             let invoker_rx = ReceiverStream::new(invoker_rx);
 
-            let invoker: InvokerService<InvokerStorageReader<PartitionStore>, Schema> =
+            let invoker: InvokerService<InvokerStorageReader, Schema> =
                 InvokerService::from_options(
                     processor.partition_id(),
                     processor.key_range(),
-                    InvokerStorageReader::new(partition_store.clone()),
+                    InvokerStorageReader::new(
+                        partition_store.clone(),
+                        // Where the invoker's reads continue when they need the disk.
+                        partition_store
+                            .partition_db()
+                            .rocksdb()
+                            .executor()
+                            .low_pri()
+                            .clone(),
+                    ),
                     invoker_tx,
                     &config.worker.invoker.service_client,
                     schema,
@@ -684,9 +718,11 @@ where
             // the invoker task's future below, binding the entry's lifetime to the
             // invoker task: cancel or panic drops the future, drops the guard, and
             // removes the entry.
-            let invoker_status_guard = node_ctx
-                .leader_handles_registry
-                .register_invoker_status(processor.key_range(), invoker.status_reader());
+            let invoker_status_guard = node_ctx.leader_handles_registry.register_invoker_status(
+                processor.partition_id(),
+                processor.key_range(),
+                invoker.status_reader(),
+            );
 
             // Register the leader-query channel separately so scheduler status (and
             // future user-limit counters) can be routed through the partition
@@ -694,9 +730,11 @@ where
             // LeaderState so it drops exactly when we step down — independent of
             // the invoker task's lifetime. When the scheduler becomes its own task,
             // it will register its own status handle and own its own guard.
-            let leader_query_guard = node_ctx
-                .leader_handles_registry
-                .register_leader_query(processor.key_range(), self.leader_query_tx.clone());
+            let leader_query_guard = node_ctx.leader_handles_registry.register_leader_query(
+                processor.partition_id(),
+                processor.key_range(),
+                self.leader_query_tx.clone(),
+            );
 
             let invoker_name = format_restring!("invoker-{}", processor.partition_id());
             let invoker_config = Configuration::live().map(|c| &c.worker.invoker);
@@ -905,6 +943,38 @@ where
 }
 
 impl<T> LeadershipState<T> {
+    /// Copies the processor's own live query state: the scheduler's and the user
+    /// limits' rows, as requested. It reads them directly, without sending a
+    /// request back into the processor's event loop, which is the caller. `None`
+    /// unless this processor leads.
+    pub fn capture_query_state(
+        &self,
+        metas: VQueuesMeta<'_>,
+        requested: restate_worker_api::PartitionCaptureRequirements,
+    ) -> Option<restate_worker_api::CapturedPartitionState> {
+        let State::Leader(leader) = &self.state else {
+            return None;
+        };
+        Some(restate_worker_api::CapturedPartitionState {
+            scheduler: requested.scheduler.then(|| {
+                let mut rows =
+                    leader.read_scheduler_status(metas, restate_types::sharding::KeyRange::FULL);
+                // Preserve the ordering of the direct scheduler query reader.
+                rows.sort_by(|(a, _), (b, _)| a.cmp(b));
+                rows.into()
+            }),
+            user_limits: requested.user_limits.then(|| {
+                let mut rows =
+                    leader.read_user_limit_counters(restate_types::sharding::KeyRange::FULL);
+                // Preserve the ordering of the direct user-limit query reader.
+                rows.sort_by_key(|row| row.partition_key);
+                rows.into()
+            }),
+            // Read by the manager's handle after admission.
+            invoker: None,
+        })
+    }
+
     pub fn contains_vqueue(&self, handle: VQueueHandle) -> bool {
         match &self.state {
             State::Leader(leader_state) => leader_state.contains_vqueue(handle),
@@ -1158,9 +1228,8 @@ mod tests {
             )
             .await?;
 
-        // Winning the campaign first proposes a VersionBarrier to enable the journal-v2
-        // default (since v1.7.0) and the unique-random-seeds and vqueues defaults (since
-        // v1.8.0); the processor stays `BecomingLeader` until that barrier is applied.
+        // Winning the campaign first proposes a VersionBarrier to enable the default features;
+        // the processor stays `BecomingLeader` until that barrier is applied.
         assert!(matches!(state.state, State::BecomingLeader { .. }));
 
         let record = reader.next().await.unwrap()?;
@@ -1187,12 +1256,13 @@ mod tests {
 
         // Simulate the barrier being applied to the FSM, then complete the transition
         // into a full leader (no further feature changes remain to be proposed).
-        ctx.set_enabled_features_in_memory(PersistedFeatures {
-            journal_v2: true,
-            unique_random_seeds: true,
-            vqueues: true,
-            ..PersistedFeatures::default()
-        });
+        ctx.set_enabled_features_in_memory(
+            barrier
+                .feature_changes
+                .into_iter()
+                .map(|id| PartitionFeatureChange::from_repr(id).expect("known feature change"))
+                .collect(),
+        );
         state
             .finish_becoming_leader(&mut node_ctx, &mut ctx, &mut partition_store)
             .await?;
@@ -1248,6 +1318,7 @@ mod tests {
                 preflight_invocation_termination_retention: true,
                 inconsistent_state_mutation_cleanup: true,
                 preflight_signal_recording: true,
+                byte_offsets: true,
             },
         );
         let (leader_query_tx, _leader_query_rx) = restate_worker_api::channel();

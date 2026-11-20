@@ -23,15 +23,15 @@ use tokio::time::Instant;
 use tracing::{debug, error, info, instrument, warn};
 
 use restate_core::ShutdownError;
-use restate_core::io::{AdmissionClosed, Gate, IoExecutor, IoOp};
+use restate_core::io::{AdmissionClosed, Gate, IdleTracker, IoExecutor, IoOp};
 use restate_rocksdb::configuration::{CfConfigurator, DbConfigurator};
 use restate_rocksdb::reads::ColumnFamilies;
 use restate_rocksdb::{
-    CfHandles, DbName, Guarded, RawRocksDb, RocksAccess, RocksDb, RocksDbReadPerfGuard, RocksError,
-    SinglePoolExecutor, StorageOp, StorageTaskKind,
+    CfHandles, DbName, Gated, Guarded, RawRocksDb, RocksAccess, RocksDb, RocksDbManager,
+    RocksDbReadPerfGuard, RocksError, SinglePoolExecutor, StorageOp, StorageTaskKind,
 };
 use restate_storage_api::StorageError;
-use restate_types::config::Configuration;
+use restate_types::config::{Configuration, RocksDbCompaction};
 use restate_types::logs::{Lsn, SequenceNumber};
 use restate_types::partitions::{CfName, Partition};
 use restate_util_bytecount::ByteCount;
@@ -39,6 +39,7 @@ use restate_util_lifecycle::{KeepAlive, Scope, ScopePayload};
 use restate_util_string::ToReString;
 use restate_util_time::DurationExt;
 
+use crate::compaction_filter::PartitionCompactionFactory;
 use crate::durable_lsn_tracking::{
     AppliedLsnCollectorFactory, DurableLsnEventListener, DurableLsnSenders,
 };
@@ -99,7 +100,8 @@ type Session = Scope<Scope<PhysicalPartition>>;
 /// A read of a partition prepared with [`PartitionDb::prepare_read`]: an
 /// operation on the partition's physical scope, `F`, measured by the perf guard
 /// that `G` creates.
-pub(crate) type PreparedRead<'a, F, G> = StorageOp<'a, &'a Scope<PhysicalPartition>, Guarded<F, G>>;
+pub(crate) type PreparedRead<'a, F, G> =
+    StorageOp<&'a Scope<PhysicalPartition>, Guarded<F, G>, Gated<'a>>;
 
 /// A partition's column families, and the state that lives as long as they do.
 /// See [`PartitionDb`] for how it relates to the partition's sessions.
@@ -112,6 +114,17 @@ pub struct PhysicalPartition {
     durable_lsn: watch::Sender<Lsn>,
     archived_lsn: watch::Sender<Option<Lsn>>,
     notifications: Arc<DurableLsnSenders>,
+    /// The published registry, with the indexes maintained on entry writes, as
+    /// reconciled when the partition was opened and updated by each commit that
+    /// changes it. Shared by every session and clone, so no handle keeps a stale
+    /// one.
+    published_registry: parking_lot::RwLock<Option<Arc<crate::registry::PublishedRegistry>>>,
+    /// What the background walk drivers did, across sessions.
+    walk_stats: crate::walk::WalkStats,
+    /// Why the running walk driver's walks aren't progressing, if one runs.
+    driver_state: crate::walk::PublishedDriverState,
+    /// The faults armed for the partition, shared with its cell.
+    faults: Faults,
     // Looked up once, when the partition is first opened, and shared by every
     // session. Last, because it holds the keep-alive of the database.
     cfs: CfHandles<KeyKind>,
@@ -145,6 +158,7 @@ impl PartitionDb {
         meta: Arc<Partition>,
         archived_lsn: watch::Sender<Option<Lsn>>,
         database: PartitionStoreDb,
+        faults: Faults,
     ) -> Option<Self> {
         // For now, every key kind lives in the partition's only column family.
         let cfs = CfHandles::new(&database.rocksdb, [meta.cf_name()], |_| 0).ok()?;
@@ -155,6 +169,10 @@ impl PartitionDb {
                 durable_lsn: watch::Sender::new(Lsn::INVALID),
                 archived_lsn,
                 notifications: database.notifications,
+                published_registry: Default::default(),
+                walk_stats: Default::default(),
+                driver_state: Default::default(),
+                faults,
                 cfs,
             },
         );
@@ -177,6 +195,35 @@ impl PartitionDb {
 
     pub fn partition(&self) -> &Arc<Partition> {
         &self.physical().meta
+    }
+
+    /// The published registry, once installed; see
+    /// [`Self::install_published_registry`].
+    pub(crate) fn published_registry(&self) -> Option<Arc<crate::registry::PublishedRegistry>> {
+        self.physical().published_registry.read().clone()
+    }
+
+    /// Publishes `published_registry` to every session and handle of this partition.
+    pub(crate) fn install_published_registry(
+        &self,
+        published_registry: Arc<crate::registry::PublishedRegistry>,
+    ) {
+        *self.physical().published_registry.write() = Some(published_registry);
+    }
+
+    /// What the background walk drivers of this partition did.
+    pub(crate) fn walk_stats(&self) -> &crate::walk::WalkStats {
+        &self.physical().walk_stats
+    }
+
+    /// Why the walks of this partition's running driver aren't progressing.
+    pub(crate) fn driver_state(&self) -> &crate::walk::PublishedDriverState {
+        &self.physical().driver_state
+    }
+
+    /// The faults armed for the partition.
+    pub(crate) fn faults(&self) -> &Faults {
+        &self.physical().faults
     }
 
     pub fn rocksdb(&self) -> &Arc<RocksDb> {
@@ -232,6 +279,42 @@ impl PartitionDb {
         );
         self.run_background_op(|scope, gate| RocksDb::prepare_flush(scope, gate, wait))
             .await?
+    }
+
+    /// How much disk space the partition's data takes up, in bytes.
+    ///
+    /// This is the total size of the SST files of all the partition's column families. It is
+    /// exact, not an estimate, and counts each file once, including files that only older
+    /// versions of the data still use, such as the inputs of a running compaction. Data that is
+    /// only in memtables or in the write-ahead log isn't counted. In the single-database layout,
+    /// partitions share the write-ahead log.
+    ///
+    /// Runs on the lifecycle pool, like opening and deleting partitions, so it doesn't wait for
+    /// the regular I/O pools. It isn't part of the partition's session, so it also works on a
+    /// closed partition, and it keeps the column families alive until it's done.
+    pub async fn disk_usage(&self) -> Result<u64, RocksError> {
+        let op = StorageOp::with_context(
+            self.physical_scope(),
+            self.rocksdb().gate(),
+            StorageTaskKind::ReadProperties,
+            |scope: &Scope<PhysicalPartition>| {
+                let cfs = &scope.payload().cfs;
+                let db = cfs.database().inner().as_raw_db();
+                cfs.all()
+                    .iter()
+                    .try_fold(0, |total, cf| -> Result<u64, RocksError> {
+                        // RocksDB always provides this property, so it is never `None`.
+                        let size = db
+                            .property_int_value_cf(cf, rocksdb::properties::TOTAL_SST_FILES_SIZE)?;
+                        Ok(total + size.unwrap_or_default())
+                    })
+            },
+        );
+        RocksDbManager::get()
+            .lifecycle_executor()
+            .spawn(op)?
+            .await
+            .map_err(|_| RocksError::from(ShutdownError))?
     }
 
     /// Returns a future that completes once nothing holds this partition's column
@@ -369,7 +452,12 @@ impl PartitionDb {
         );
     }
 
-    pub(crate) async fn update_memory_budget(&self, memory_budget: usize) {
+    /// `compaction` is the one the partition store was opened with.
+    pub(crate) async fn update_memory_budget(
+        &self,
+        memory_budget: usize,
+        compaction: RocksDbCompaction,
+    ) {
         // impacts only this partition's column-families
         let physical = self.physical_scope().clone();
 
@@ -381,7 +469,7 @@ impl PartitionDb {
             let partition = physical.payload();
             let rocksdb = partition.cfs.database();
             let opts = &Configuration::pinned().worker.storage;
-            let mem_config = PartitionDbMemoryConfig::calculate(memory_budget, opts);
+            let mem_config = PartitionDbMemoryConfig::calculate(memory_budget, opts, &compaction);
             let max_bytes_for_level_base_str = mem_config.max_bytes_for_level_base().to_restring();
             let write_buffer_size_str = mem_config.write_buffer_size().to_restring();
             let max_write_buffer_number_str = mem_config.num_write_buffers().to_restring();
@@ -444,9 +532,19 @@ impl PartitionDb {
     }
 }
 
+/// A partition's local store that [`crate::PartitionStoreManager::drop_partition_store`]
+/// deleted, or that [`crate::PartitionStoreManager::preview_drop_partition_store`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DroppedPartitionStore {
+    /// How much disk space the store used right before the deletion, see
+    /// [`PartitionDb::disk_usage`]. `None` if it couldn't be measured, such as for a column
+    /// family that the store didn't know about, or a deletion that had already started.
+    pub disk_usage: Option<u64>,
+}
+
 pub(crate) struct PartitionCell {
     meta: Arc<Partition>,
-    executor: SinglePoolExecutor,
+    executor: IdleTracker<SinglePoolExecutor>,
     archived_lsn: watch::Sender<Option<Lsn>>,
     /// Shared so that a snapshot capture can hold the read lock until its export finishes.
     pub(crate) inner: Arc<AsyncRwLock<State>>,
@@ -454,13 +552,13 @@ pub(crate) struct PartitionCell {
 }
 
 impl PartitionCell {
-    pub fn new(partition: Partition, executor: SinglePoolExecutor) -> Self {
+    pub fn new(partition: Partition, executor: IdleTracker<SinglePoolExecutor>) -> Self {
         Self {
             meta: Arc::new(partition),
             executor,
             archived_lsn: Default::default(),
             inner: Arc::new(AsyncRwLock::new(State::Unknown)),
-            faults: Faults::default(),
+            faults: Default::default(),
         }
     }
 
@@ -511,6 +609,7 @@ impl PartitionCell {
             self.meta.clone(),
             self.archived_lsn.clone(),
             database.clone(),
+            self.faults.clone(),
         ) {
             Some(db) => {
                 self.open_local_cf(guard, db);
@@ -616,6 +715,7 @@ impl PartitionCell {
         let meta = self.meta.clone();
         let partition_id = meta.partition_id;
         let archived_lsn = self.archived_lsn.clone();
+        let faults = self.faults.clone();
         let (completion, result) = watch::channel(None);
         **guard = State::Opening { result };
         let worker_completion = completion.clone();
@@ -635,7 +735,7 @@ impl PartitionCell {
                         rocksdb: Arc::clone(rocksdb),
                         notifications,
                     };
-                    let db = PartitionDb::new(meta, archived_lsn, database)
+                    let db = PartitionDb::new(meta, archived_lsn, database, faults)
                         .ok_or_else(|| RocksError::UnknownColumnFamily(cf_name.into()))?;
                     // Load the durable LSN before anyone can see the partition or subscribe
                     // to its durability updates. If the read fails, keep the partition anyway
@@ -766,6 +866,15 @@ impl PartitionCell {
         guard: &mut tokio::sync::RwLockWriteGuard<'_, State>,
     ) -> Result<(), RocksError> {
         guard.finish_abandoned_open().await?;
+        self.start_drop_cf(guard);
+        guard.finish_retirement().await?;
+        self.set_cf_missing(guard).await;
+        Ok(())
+    }
+
+    /// The part of [`Self::drop_cf`] that doesn't wait: the partition stops accepting work, and
+    /// its column family is deleted in the background once nothing uses it anymore.
+    fn start_drop_cf(&self, guard: &mut tokio::sync::RwLockWriteGuard<'_, State>) {
         if let Some(db) = guard.db() {
             db.gate().seal();
             db.unregister_durable_lsn();
@@ -777,13 +886,11 @@ impl PartitionCell {
                 released.await;
             });
         }
-        guard.finish_retirement().await?;
-        self.set_cf_missing(guard).await;
-        Ok(())
     }
 
     /// Deletes the partition's column family, whatever state the cell is in, and
-    /// leaves the cell `CfMissing`. Returns whether there was a column family to delete.
+    /// leaves the cell `CfMissing`. Returns what was deleted, or `None` if there was no
+    /// column family to delete.
     ///
     /// Unlike [`Self::drop_cf`], this also finds a column family the cell doesn't know
     /// about: one that is on disk but wasn't opened by this process yet (`Unknown`),
@@ -792,7 +899,7 @@ impl PartitionCell {
         &self,
         guard: &mut tokio::sync::RwLockWriteGuard<'_, State>,
         database: &PartitionStoreDb,
-    ) -> Result<bool, RocksError> {
+    ) -> Result<Option<DroppedPartitionStore>, RocksError> {
         if guard.is_unknown() {
             self.open_cf(guard, database).await;
         }
@@ -809,8 +916,23 @@ impl PartitionCell {
             self.start_retirement(guard, database.rocksdb.clone(), std::future::ready(()));
         }
         let existed = guard.db().is_some() || matches!(**guard, State::Retiring { .. });
+        // Stop accepting work right away, then measure what is about to be deleted. The
+        // deletion waits for the measurement, since `db` keeps the column families alive.
+        let db = guard.db().cloned();
+        self.start_drop_cf(guard);
+        let disk_usage = match db {
+            Some(db) => db
+                .disk_usage()
+                .await
+                .inspect_err(|error| {
+                    warn!(%error, "Could not measure the partition store before dropping it");
+                })
+                .ok(),
+            None => None,
+        };
         self.drop_cf(guard).await?;
-        Ok(self.drop_stale_cf(guard, &database.rocksdb).await? || existed)
+        let dropped = self.drop_stale_cf(guard, &database.rocksdb).await? || existed;
+        Ok(dropped.then_some(DroppedPartitionStore { disk_usage }))
     }
 
     /// Clone the underlying [`PartitionDb`], if it is open.
@@ -1067,6 +1189,8 @@ pub struct RocksConfigurator<T> {
     memory_budget: Arc<MemoryBudget>,
     durable_lsn_notifications: Arc<DurableLsnSenders>,
     use_multi_db_layout: bool,
+    /// Read when the node started, not from the current configuration.
+    compaction: RocksDbCompaction,
     _marker: PhantomData<T>,
 }
 
@@ -1076,6 +1200,7 @@ impl<T> Clone for RocksConfigurator<T> {
             memory_budget: self.memory_budget.clone(),
             durable_lsn_notifications: self.durable_lsn_notifications.clone(),
             use_multi_db_layout: self.use_multi_db_layout,
+            compaction: self.compaction,
             _marker: PhantomData,
         }
     }
@@ -1086,11 +1211,13 @@ impl<T> RocksConfigurator<T> {
         memory_budget: Arc<MemoryBudget>,
         notifications: &Arc<DurableLsnSenders>,
         use_multi_db_layout: bool,
+        compaction: RocksDbCompaction,
     ) -> Self {
         Self {
             memory_budget,
             durable_lsn_notifications: notifications.clone(),
             use_multi_db_layout,
+            compaction,
             _marker: PhantomData,
         }
     }
@@ -1215,21 +1342,13 @@ impl CfConfigurator for RocksConfigurator<AllDataCf> {
 
         // Keys shorter than the cap are their own prefix, so every key is in the extractor's domain.
         cf_options.set_capped_prefix_extractor(crate::PREFIX_EXTRACTOR_LENGTH);
+        cf_options.set_compaction_filter_factory(PartitionCompactionFactory);
         cf_options.set_memtable_prefix_bloom_ratio(0.2);
         cf_options.set_memtable_whole_key_filtering(whole_key_filtering);
 
         cf_options.set_num_levels(7);
-        let l0_l1 = if config.rocksdb.rocksdb_disable_l0_l1_compression() {
-            rocksdb::DBCompressionType::None
-        } else {
-            rocksdb::DBCompressionType::Lz4
-        };
-        let levels = restate_rocksdb::configuration::build_compression_per_level(
-            7,
-            l0_l1,
-            rocksdb::DBCompressionType::Zstd,
-        );
-        cf_options.set_compression_per_level(&levels);
+        restate_rocksdb::configuration::set_compaction(&mut cf_options, &self.compaction);
+        restate_rocksdb::configuration::set_compression(&mut cf_options, &config.rocksdb);
 
         // Always collect applied LSN table properties in partition store CFs
         cf_options.add_table_properties_collector_factory(AppliedLsnCollectorFactory);
@@ -1238,6 +1357,7 @@ impl CfConfigurator for RocksConfigurator<AllDataCf> {
         let mem_config = PartitionDbMemoryConfig::calculate(
             self.memory_budget.current_per_partition_budget(),
             config,
+            &self.compaction,
         );
         tracing::debug!(
             "Configured {db_name}/{cf_name} with memtable budget={}",

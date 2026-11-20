@@ -15,7 +15,9 @@ use restate_types::vqueues::{CanonicalEntryId, Seq, VQueueId};
 use super::RawStatusHeaderRef;
 use super::filters::{ScanEntryIdFilter, ScanMetaFilter};
 use super::metadata::{VQueueMeta, VQueueMetaRef};
-use super::{EntryContext, EntryId, EntryKey, EntryStateRef, EntryStatusHeader, EntryValue};
+use super::{
+    EntryContext, EntryId, EntryKey, EntryStateRef, EntryStatusHeader, EntryValue, StoredEntryRef,
+};
 use crate::Result;
 
 /// Stages in the inbox/vqueue
@@ -28,9 +30,16 @@ use crate::Result;
     PartialOrd,
     Ord,
     bilrost::Enumeration,
+    enum_map::Enum,
     strum::EnumCount,
     strum::FromRepr,
     strum::Display,
+    strum::VariantArray,
+    zerocopy::IntoBytes,
+    zerocopy::TryFromBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+    zerocopy::Unaligned,
 )]
 #[repr(u8)]
 #[strum(serialize_all = "kebab-case")]
@@ -56,9 +65,21 @@ pub enum Stage {
     #[bilrost(5)]
     Finished = b'f',
 }
+
 impl Stage {
     pub const fn serialized_length_fixed() -> usize {
         std::mem::size_of::<Self>()
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Stage::Unknown => "unknown",
+            Stage::Inbox => "inbox",
+            Stage::Running => "running",
+            Stage::Suspended => "suspended",
+            Stage::Paused => "paused",
+            Stage::Finished => "finished",
+        }
     }
 }
 
@@ -176,14 +197,18 @@ pub trait WriteVQueueTable {
     fn update_vqueue_entry_status(
         &mut self,
         context: &EntryContext<'_>,
-        before: EntryStateRef<'_>,
+        before: StoredEntryRef<'_>,
         after: EntryStateRef<'_>,
     );
 
     /// Deletes an existing status by base identity, without checking its sequence.
     /// `before` must describe the actual previous state, including earlier writes in
     /// this transaction. This operation does not read or compare against storage.
-    fn delete_vqueue_entry_status(&mut self, context: &EntryContext<'_>, before: EntryStateRef<'_>);
+    fn delete_vqueue_entry_status(
+        &mut self,
+        context: &EntryContext<'_>,
+        before: StoredEntryRef<'_>,
+    );
 
     /// Stores a vqueue entry input payload
     fn put_vqueue_input_payload<E>(

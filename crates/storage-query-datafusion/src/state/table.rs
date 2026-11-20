@@ -11,43 +11,45 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use bytes::Bytes;
-use restate_partition_store::{PartitionStore, PartitionStoreManager};
-use restate_storage_api::StorageError;
-use restate_storage_api::state_table::ScanStateTable;
+use datafusion::catalog::TableProvider;
+
+use restate_partition_store::keys::selection::KeySelection;
+use restate_partition_store::state_table::{ScopedStateTable, StateTable as StoredStateTable};
+use restate_partition_store::{PartitionStoreManager, QueryIoExecutor, ReadSnapshot};
+use restate_storage_api::scan::ScanOutcome;
 use restate_types::identifiers::ServiceId;
 use restate_types::sharding::KeyRange;
 
-use crate::context::{QueryContext, SelectPartitions};
+use crate::context::SelectPartitions;
 use crate::filter::FirstMatchingPartitionKeyExtractor;
-use crate::partition_store_scanner::{LocalPartitionsScanner, ScanLocalPartition};
+use crate::partition_store_scanner::{LocalPartitionsScanner, Rows, ScanLocalPartition};
 use crate::remote_query_scanner_manager::RemoteScannerManager;
 use crate::state::row::append_state_row;
-use crate::state::schema::{StateBuilder, state_sort_order};
+use crate::state::schema::{StateBuilder, StateTable, state_sort_order};
 use crate::table_providers::{PartitionedTableProvider, ScanPartition};
 
-const NAME: &str = "state";
+impl StateTable {
+    pub(crate) fn create_provider(
+        partition_selector: impl SelectPartitions,
+        remote_scanner_manager: &RemoteScannerManager,
+    ) -> Arc<dyn TableProvider> {
+        let table = PartitionedTableProvider::new(
+            partition_selector,
+            StateBuilder::schema(),
+            state_sort_order(),
+            remote_scanner_manager.create_distributed_scanner::<Self>(),
+            FirstMatchingPartitionKeyExtractor::default()
+                .with_scope_or_service_key("scope", "service_key"),
+        );
+        Arc::new(table)
+    }
 
-pub(crate) fn register_self(
-    ctx: &QueryContext,
-    partition_selector: impl SelectPartitions,
-    partition_store_manager: Arc<PartitionStoreManager>,
-    remote_scanner_manager: &RemoteScannerManager,
-) -> datafusion::common::Result<()> {
-    let local_scanner = Arc::new(LocalPartitionsScanner::new(
-        partition_store_manager,
-        StateScanner,
-    )) as Arc<dyn ScanPartition>;
-
-    let table = PartitionedTableProvider::new(
-        partition_selector,
-        StateBuilder::schema(),
-        state_sort_order(),
-        remote_scanner_manager.create_distributed_scanner(NAME, local_scanner),
-        FirstMatchingPartitionKeyExtractor::default()
-            .with_scope_or_service_key("scope", "service_key"),
-    );
-    ctx.register_partitioned_table(NAME, Arc::new(table))
+    pub(crate) fn create_local_scanner(
+        partition_store_manager: Arc<PartitionStoreManager>,
+        io_executor: QueryIoExecutor,
+    ) -> impl ScanPartition {
+        LocalPartitionsScanner::<StateScanner>::new(partition_store_manager, io_executor)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -55,30 +57,53 @@ struct StateScanner;
 
 impl ScanLocalPartition for StateScanner {
     type Builder = StateBuilder;
-    type Item<'a> = (ServiceId, Bytes, &'a [u8]);
-    type ConversionError = std::convert::Infallible;
     type Filter = KeyRange;
 
-    fn for_each_row<
-        F: for<'a> FnMut(
-                Self::Item<'a>,
-            ) -> std::ops::ControlFlow<Result<(), Self::ConversionError>>
-            + Send
-            + Sync
-            + 'static,
-    >(
-        partition_store: &PartitionStore,
+    async fn scan(
+        snapshot: &ReadSnapshot,
+        executor: &QueryIoExecutor,
         range: KeyRange,
-        mut f: F,
-    ) -> Result<impl Future<Output = restate_storage_api::Result<()>> + Send, StorageError> {
-        partition_store.for_each_user_state(range, move |item| f(item).map_break(Result::unwrap))
-    }
-
-    fn append_row<'a>(
-        row_builder: &mut Self::Builder,
-        value: Self::Item<'a>,
-    ) -> Result<(), Self::ConversionError> {
-        append_state_row(row_builder, value.0, value.1, value.2);
-        Ok(())
+        rows: Rows<Self::Builder>,
+    ) -> restate_storage_api::Result<ScanOutcome<Rows<Self::Builder>>> {
+        let rows = match rows
+            .read::<StoredStateTable>(
+                snapshot,
+                executor,
+                "df-user-state",
+                Arc::new(KeySelection::all().restrict_scope(range)),
+                |builder, (key, value)| {
+                    let (partition_key, service_name, service_key, state_key) =
+                        key.decode_all()?.split();
+                    append_state_row(
+                        builder,
+                        ServiceId::from_parts(partition_key, service_name, service_key),
+                        state_key,
+                        value,
+                    );
+                    Ok(())
+                },
+            )
+            .await?
+        {
+            ScanOutcome::Exhausted(rows) => rows,
+            stopped => return Ok(stopped),
+        };
+        rows.read::<ScopedStateTable>(
+            snapshot,
+            executor,
+            "df-user-state-scoped",
+            Arc::new(KeySelection::all().restrict_scope(range)),
+            |builder, (key, value)| {
+                let (_, scope, service_name, service_key, state_key) = key.decode_all()?.split();
+                append_state_row(
+                    builder,
+                    ServiceId::new(scope, service_name.as_str(), service_key.as_str()),
+                    state_key,
+                    value,
+                );
+                Ok(())
+            },
+        )
+        .await
     }
 }

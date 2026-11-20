@@ -12,7 +12,9 @@ use std::num::NonZeroU32;
 
 use rocksdb::{BlockBasedOptions, WriteBufferManager};
 
-use restate_types::config::{RocksDbLogLevel, RocksDbOptions, StatisticsLevel};
+use restate_types::config::{
+    RocksDbCompaction, RocksDbCompressionType, RocksDbLogLevel, RocksDbOptions, StatisticsLevel,
+};
 
 use crate::logging::LoggingEventListener;
 use crate::{DbEnv, DbName, OpenMode, RocksAccess};
@@ -189,21 +191,56 @@ pub fn convert_log_level(input: RocksDbLogLevel) -> rocksdb::LogLevel {
     }
 }
 
-/// Builds a per-level compression array for `num_levels` levels.
+fn convert_compression(input: RocksDbCompressionType) -> rocksdb::DBCompressionType {
+    match input {
+        RocksDbCompressionType::None => rocksdb::DBCompressionType::None,
+        RocksDbCompressionType::Lz4 => rocksdb::DBCompressionType::Lz4,
+        RocksDbCompressionType::Zstd => rocksdb::DBCompressionType::Zstd,
+    }
+}
+
+/// Sets the SST compression of every level from `rocksdb-compression`. RocksDB repeats the last
+/// entry of the per-level list for every level below it, and the bottommost setting takes
+/// precedence for the last level that holds data.
+pub fn set_compression(cf_options: &mut rocksdb::Options, opts: &RocksDbOptions) {
+    let compression = opts.rocksdb_compression();
+    cf_options.set_compression_per_level(&[
+        convert_compression(compression.l0),
+        convert_compression(compression.middle),
+    ]);
+    cf_options.set_bottommost_compression_type(convert_compression(compression.bottommost));
+}
+
+/// Sets the compaction style and, for universal compaction, its options. The compaction trigger,
+/// `level0_file_num_compaction_trigger`, is left to the caller: see
+/// [`RocksDbCompaction::compaction_trigger`]. Later updates of the trigger must use the same
+/// `compaction`, as RocksDB rejects a trigger above the `max_read_amp` set here.
 ///
-/// L0 and L1 use `l0_l1_compression`, remaining levels use `upper_compression`.
-pub fn build_compression_per_level(
-    num_levels: usize,
-    l0_l1_compression: rocksdb::DBCompressionType,
-    upper_compression: rocksdb::DBCompressionType,
-) -> Vec<rocksdb::DBCompressionType> {
-    (0..num_levels)
-        .map(|level| {
-            if level <= 1 {
-                l0_l1_compression
-            } else {
-                upper_compression
+/// Keep the number of levels the same for both styles. Universal compaction then opens a database
+/// written with leveled compaction without a migration, every non-empty level becoming one sorted
+/// run, and the other way round.
+pub fn set_compaction(cf_options: &mut rocksdb::Options, compaction: &RocksDbCompaction) {
+    match compaction {
+        RocksDbCompaction::Level => {
+            cf_options.set_compaction_style(rocksdb::DBCompactionStyle::Level);
+        }
+        RocksDbCompaction::Universal(universal) => {
+            let to_c_int = |v: u32| i32::try_from(v).unwrap_or(i32::MAX);
+            let mut options = rocksdb::UniversalCompactOptions::default();
+            options.set_size_ratio(to_c_int(universal.size_ratio));
+            options.set_min_merge_width(to_c_int(universal.effective_min_merge_width()));
+            if let Some(max_merge_width) = universal.effective_max_merge_width() {
+                options.set_max_merge_width(to_c_int(max_merge_width));
             }
-        })
-        .collect()
+            options.set_max_size_amplification_percent(to_c_int(
+                universal.max_size_amplification_percent,
+            ));
+            options.set_allow_trivial_move(universal.allow_trivial_move);
+            if let Some(max_read_amp) = universal.effective_max_read_amp() {
+                options.set_max_read_amp(to_c_int(max_read_amp));
+            }
+            cf_options.set_compaction_style(rocksdb::DBCompactionStyle::Universal);
+            cf_options.set_universal_compaction_options(&options);
+        }
+    }
 }

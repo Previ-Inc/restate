@@ -19,7 +19,7 @@ use restate_types::partitions::Partition;
 use tokio_stream::StreamExt;
 
 use crate::{PartitionStore, PartitionStoreManager};
-use restate_rocksdb::RocksDbManager;
+use restate_rocksdb::{RocksDbManager, SinglePoolExecutor};
 use restate_storage_api::StorageError;
 use restate_types::identifiers::{
     InvocationId, PartitionId, PartitionKey, PartitionProcessorRpcRequestId, ServiceId,
@@ -30,6 +30,7 @@ use restate_types::state_mut::ExternalStateMutation;
 
 mod barrier_test;
 mod durable_lsn_tracking_test;
+mod fsm_position_test;
 mod inbox_table_test;
 mod invocation_status_table_test;
 mod journal_events_table_test;
@@ -44,6 +45,12 @@ mod state_table_test;
 mod timer_table_test;
 mod virtual_object_status_table_test;
 mod vqueue_table_test;
+
+/// The storage pool that the reads of `store` continue on when they need the
+/// disk.
+fn low_pri_executor(store: &PartitionStore) -> SinglePoolExecutor {
+    store.partition_db().rocksdb().executor().low_pri().clone()
+}
 
 async fn storage_test_environment() -> PartitionStore {
     storage_test_environment_with_manager(true).await.1

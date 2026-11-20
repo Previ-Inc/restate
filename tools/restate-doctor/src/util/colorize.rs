@@ -17,8 +17,9 @@
 use std::fmt::Write;
 
 use crossterm::style::{Color, Stylize};
+
 use restate_cli_util::CliContext;
-use restate_partition_store::keys::KeyKind;
+use restate_partition_store::keys::{IndexKeyPrefix, KeyKind};
 
 use super::HEX_CHARS;
 
@@ -28,7 +29,7 @@ use super::HEX_CHARS;
 pub enum KeySegment {
     /// KeyKind prefix (2 bytes) - always first
     Kind,
-    /// Partition key or partition id (8 bytes) - always second
+    /// Partition key or physical partition id
     Partition,
     /// Fixed-size fields like InvocationUuid (16 bytes), u32, u64
     FixedField,
@@ -82,6 +83,49 @@ fn build_segments(key: &[u8]) -> Vec<Segment> {
         Some(k) => k,
         None => return segments, // Unknown key type, only show kind
     };
+
+    if key_kind == KeyKind::Blob {
+        // BlobId is not prefixed by the partition key: timestamp(8) + seq(8) + partition_key(8) + remainder(16)
+        let mut pos = 2;
+        let fields = [
+            (8, KeySegment::FixedField, "timestamp"),
+            (8, KeySegment::FixedField, "seq"),
+            (8, KeySegment::Partition, "partition_key"),
+            (16, KeySegment::FixedField, "remainder"),
+        ];
+        for (len, kind, label) in fields {
+            if pos + len > key.len() {
+                break;
+            }
+            segments.push(Segment {
+                kind,
+                start: pos,
+                len,
+                label,
+            });
+            pos += len;
+        }
+        return segments;
+    }
+
+    if key_kind == KeyKind::Stats {
+        build_stats_segments(key, &mut segments);
+        return segments;
+    }
+    #[allow(deprecated)]
+    if key_kind == KeyKind::LegacyStats {
+        return segments;
+    }
+
+    if key_kind == KeyKind::SecondaryIndex {
+        build_secondary_index_segments(key, &mut segments);
+        return segments;
+    }
+
+    if key_kind == KeyKind::Registry {
+        build_registry_segments(key, &mut segments);
+        return segments;
+    }
 
     if key.len() < 10 {
         return segments;
@@ -385,6 +429,8 @@ fn build_segments(key: &[u8]) -> Vec<Segment> {
                 }
             }
         }
+        // Handled above, blob keys are not prefixed by the partition key
+        KeyKind::Blob => {}
         KeyKind::JournalV2NotificationIdToNotificationIndex => {
             // InvocationUuid (16 bytes) + notification_id (var)
             if remaining >= 16 {
@@ -491,9 +537,95 @@ fn build_segments(key: &[u8]) -> Vec<Segment> {
                 }
             }
         }
+        #[allow(deprecated)]
+        KeyKind::Stats | KeyKind::LegacyStats | KeyKind::SecondaryIndex | KeyKind::Registry => {
+            unreachable!("handled before the standard partition header")
+        }
     }
 
     segments
+}
+
+fn build_secondary_index_segments(key: &[u8], segments: &mut Vec<Segment>) {
+    let fields = [
+        (KeySegment::FixedField, 2, "partition_padding"),
+        (KeySegment::Partition, 2, "partition"),
+        (KeySegment::FixedField, 4, "index_id"),
+    ];
+    let mut start = KeyKind::SERIALIZED_LENGTH;
+    for (kind, len, label) in fields {
+        if start >= key.len() {
+            return;
+        }
+        segments.push(Segment {
+            kind,
+            start,
+            len: len.min(key.len() - start),
+            label,
+        });
+        start += len;
+    }
+    if key.len() > IndexKeyPrefix::SERIALIZED_LENGTH {
+        segments.push(Segment {
+            kind: KeySegment::VariableField,
+            start: IndexKeyPrefix::SERIALIZED_LENGTH,
+            len: key.len() - IndexKeyPrefix::SERIALIZED_LENGTH,
+            label: "index_key",
+        });
+    }
+}
+
+/// A registry record's key: `rg | padding | partition | record kind | ID`.
+fn build_registry_segments(key: &[u8], segments: &mut Vec<Segment>) {
+    let fields = [
+        (KeySegment::FixedField, 2, "partition_padding"),
+        (KeySegment::Partition, 2, "partition"),
+        (KeySegment::FixedField, 1, "record"),
+        (KeySegment::FixedField, 8, "id"),
+    ];
+    let mut start = KeyKind::SERIALIZED_LENGTH;
+    for (kind, len, label) in fields {
+        if start >= key.len() {
+            return;
+        }
+        segments.push(Segment {
+            kind,
+            start,
+            len: len.min(key.len() - start),
+            label,
+        });
+        start += len;
+    }
+}
+
+fn build_stats_segments(key: &[u8], segments: &mut Vec<Segment>) {
+    let fields = [
+        (KeySegment::FixedField, 2, "partition_padding"),
+        (KeySegment::Partition, 2, "partition"),
+        (KeySegment::FixedField, 4, "index_id"),
+        (KeySegment::FixedField, 1, "stat_kind"),
+    ];
+    let mut start = KeyKind::SERIALIZED_LENGTH;
+    for (kind, len, label) in fields {
+        if start >= key.len() {
+            return;
+        }
+        segments.push(Segment {
+            kind,
+            start,
+            len: len.min(key.len() - start),
+            label,
+        });
+        start += len;
+    }
+    if key.len() > start {
+        segments.push(Segment {
+            kind: KeySegment::VariableField,
+            start,
+            len: key.len() - start,
+            label: "stat_key",
+        });
+    }
 }
 
 /// Parse varint-prefixed variable-length fields.
@@ -568,7 +700,7 @@ fn decode_varint(data: &[u8]) -> Option<(usize, usize)> {
 /// Each segment of the key is colored differently to help visualize
 /// the key structure:
 /// - Cyan: KeyKind prefix (2 bytes)
-/// - Yellow: Partition key/id (8 bytes)
+/// - Yellow: Partition key/id
 /// - Green: Fixed-size fields (uuids, indices, etc.)
 /// - Magenta: Variable-length field data
 /// - Grey: Length prefixes for variable fields
@@ -685,5 +817,78 @@ mod tests {
         assert!(labels.contains(&"scope"));
         assert!(labels.contains(&"service_name"));
         assert!(labels.contains(&"lock_key"));
+    }
+
+    #[test]
+    fn build_segments_for_blob_key() {
+        use restate_types::blob::BlobId;
+        use restate_types::clock::UniqueTimestamp;
+
+        let blob_id = BlobId::new(UniqueTimestamp::MIN, 7u64, 42, [0xab; 16]);
+        let mut key = Vec::new();
+        key.extend_from_slice(KeyKind::Blob.as_bytes());
+        key.extend_from_slice(&blob_id.to_bytes());
+
+        let segments = build_segments(&key);
+        let labels: Vec<&str> = segments.iter().map(|s| s.label).collect();
+        assert_eq!(
+            labels,
+            ["kind", "timestamp", "seq", "partition_key", "remainder"]
+        );
+
+        let pk = &segments[3];
+        assert!(matches!(pk.kind, KeySegment::Partition));
+        assert_eq!((pk.start, pk.len), (18, 8));
+        assert_eq!(key[pk.start..pk.start + pk.len], 42u64.to_be_bytes());
+
+        let last = segments.last().unwrap();
+        assert_eq!(last.start + last.len, key.len());
+    }
+
+    #[test]
+    fn build_segments_for_stat_key() {
+        let key: &[u8] = b"zR\x00\x00\x00\x07\x00\x01\x11\x70\x03payload";
+
+        let segments = build_segments(key);
+        let fields: Vec<(&str, usize, usize)> = segments
+            .iter()
+            .map(|segment| (segment.label, segment.start, segment.len))
+            .collect();
+        assert_eq!(
+            fields,
+            vec![
+                ("kind", 0, 2),
+                ("partition_padding", 2, 2),
+                ("partition", 4, 2),
+                ("index_id", 6, 4),
+                ("stat_kind", 10, 1),
+                ("stat_key", 11, 7),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_segments_for_secondary_index_key() {
+        let key: &[u8] = b"xI\x00\x00\x00\x07\x00\x00\x00\x01payload";
+        let segments = build_segments(key);
+        let fields: Vec<_> = segments
+            .iter()
+            .map(|segment| (segment.label, segment.start, segment.len))
+            .collect();
+        assert_eq!(
+            fields,
+            vec![
+                ("kind", 0, 2),
+                ("partition_padding", 2, 2),
+                ("partition", 4, 2),
+                ("index_id", 6, 4),
+                ("index_key", 10, 7),
+            ]
+        );
+        for len in 0..key.len() {
+            for segment in build_segments(&key[..len]) {
+                assert!(segment.start + segment.len <= len);
+            }
+        }
     }
 }

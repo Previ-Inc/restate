@@ -35,11 +35,10 @@ resolver = "2"
 version = "1.8.2-dev"
 authors = ["restate.dev"]
 edition = "2024"
-rust-version = "1.98.1"
+rust-version = "1.100.0"
 license = "BUSL-1.1"
 repository = "https://github.com/restatedev/restate"
-homepage = "https://github.com/restatedev/restate"
-description = "Restate makes distributed applications easy!"
+homepage = "https://restate.dev"
 
 [workspace.dependencies]
 # Own crates
@@ -54,9 +53,9 @@ restate-clock = { path = "crates/clock" }
 restate-cloud-tunnel-client = { path = "crates/cloud-tunnel-client" }
 restate-core = { path = "crates/core" }
 restate-core-derive = { path = "crates/core/derive" }
+restate-distributed-datafusion = { path = "crates/distributed-datafusion" }
 restate-encoding = { path = "crates/encoding" }
 restate-errors = { path = "crates/errors" }
-restate-fs-util = { path = "crates/fs-util" }
 restate-futures-util = { path = "crates/futures-util" }
 restate-hyper-uds = { path = "crates/hyper-uds" }
 restate-ingress-http = { path = "crates/ingress-http" }
@@ -76,12 +75,12 @@ restate-partition-store = { path = "crates/partition-store" }
 restate-platform = { path = "crates/platform" }
 restate-rocksdb = { path = "crates/rocksdb" }
 restate-serde-util = { path = "crates/serde-util" }
-restate-server = { path = "server" }
 restate-lite = { path = "lite" }
 restate-service-client = { path = "crates/service-client" }
 restate-service-protocol = { path = "crates/service-protocol" }
 restate-service-protocol-v4 = { path = "crates/service-protocol-v4" }
 restate-storage-api = { path = "crates/storage-api" }
+restate-storage-query-api = { path = "crates/storage-query-api" }
 restate-storage-query-datafusion = { path = "crates/storage-query-datafusion" }
 restate-sharding = { path = "crates/sharding" }
 restate-util-bytecount = { path = "util/bytecount" }
@@ -159,6 +158,9 @@ datafusion = { version = "55.1.0", default-features = false, features = [
     "recursive_protection",
 ] }
 datafusion-functions-json = { version = "0.55.2" }
+# Temporary fork for terminal-error ordering; switch back to upstream after
+# https://github.com/datafusion-contrib/datafusion-distributed/pull/893 merges.
+datafusion-distributed = { git = "https://github.com/restatedev/datafusion-distributed", rev = "cbd361d25d1d3eb78c6d952e5e6f93526ddeb7f0", default-features = false }
 datafusion-proto = { version = "55.1.0", default-features = false }
 datafusion-sql = { version = "55.2.0", default-features = false }
 derive_builder = "0.20.2"
@@ -171,7 +173,7 @@ etcd-client = { version = "0.20.0" }
 flexbuffers = { version = "25.12.19" }
 futures = "0.3.31"
 futures-util = "0.3.31"
-gardal = { version = "0.0.1-alpha.9" }
+gardal = { version = "0.1.0" }
 generic-array = { version = "1.4.1" }
 google-cloud-auth = { version = "1.16", features = ["idtoken"] }
 googletest = { version = "0.10", features = ["anyhow"] }
@@ -209,11 +211,6 @@ mockall = { version = "0.15.0" }
 num-traits = { version = "0.2.19" }
 num_cpus = { version = "1.17.0" }
 object_store = { version = "0.14.2", features = ["aws", "azure", "gcp"] }
-# Match our jsonwebtoken provider instead of enabling Octocrab's RustCrypto default.
-octocrab = { version = "0.54.2", default-features = false, features = [
-    "follow-redirect", "retry", "rustls", "timeout", "tracing", "default-client",
-    "rustls-ring", "jwt-aws-lc-rs",
-] }
 opentelemetry = { version = "0.33" }
 opentelemetry-otlp = { version = "0.33", default-features = false }
 opentelemetry-semantic-conventions = { version = "0.33" }
@@ -230,6 +227,7 @@ prost-dto = { version = "0.0.4" }
 prost-types = { version = "0.14.1" }
 quote = "1"
 rand = "0.10.1"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "layout-cache"] }
 rcgen = "0.14.10"
 regex = { version = "1.12" }
 reqwest = { version = "0.13.5", default-features = false, features = [

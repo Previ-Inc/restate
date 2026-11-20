@@ -187,6 +187,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "approx"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cab112f0a86d568ea0e627cc1d6be74a1e9cd55214684db5561995f6dad897c6"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "ar_archive_writer"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1446,6 +1455,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
+name = "by_address"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64fa3c856b712db6612c019f14756e64e4bcea13337a6b33b696333a9eaa2d06"
+
+[[package]]
 name = "bytecount"
 version = "0.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1848,6 +1863,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
+name = "cobs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fa961b519f0b462e3a3b4a34b64d119eeaca1d59af726fe450bbba07a9fc0a1"
+dependencies = [
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "codederror"
 version = "1.8.2-dev"
 dependencies = [
@@ -1902,6 +1926,20 @@ dependencies = [
  "crossterm",
  "unicode-segmentation",
  "unicode-width",
+]
+
+[[package]]
+name = "compact_str"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9dfdd1c2274d9aa354115b09dc9a901d6c5576818cdf70d14cae2bdb47df00ab"
+dependencies = [
+ "castaway",
+ "cfg-if",
+ "itoa",
+ "rustversion",
+ "ryu",
+ "static_assertions",
 ]
 
 [[package]]
@@ -2228,6 +2266,15 @@ name = "crossbeam-epoch"
 version = "0.9.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc74980687109a3b14c72fd458107bf0baa1da1a1a805e178d15501ba9b86d9d"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-queue"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03e8bd762f7479489c70ed6c768ddca99d7296857de437a68dcb2a94365b3fae"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -2705,6 +2752,39 @@ dependencies = [
  "object_store 0.13.2",
  "tokio",
  "tokio-stream",
+]
+
+[[package]]
+name = "datafusion-distributed"
+version = "4.0.0"
+source = "git+https://github.com/restatedev/datafusion-distributed?rev=cbd361d25d1d3eb78c6d952e5e6f93526ddeb7f0#cbd361d25d1d3eb78c6d952e5e6f93526ddeb7f0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "crossbeam-queue",
+ "dashmap",
+ "datafusion",
+ "datafusion-proto",
+ "delegate",
+ "futures",
+ "http",
+ "itertools 0.14.0",
+ "moka",
+ "num-traits",
+ "pin-project",
+ "postcard",
+ "prost",
+ "rand 0.9.5",
+ "sketches-ddsketch",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic-prost",
+ "url",
+ "uuid",
+ "zstd 0.13.4",
 ]
 
 [[package]]
@@ -3206,6 +3286,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "delegate"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "780eb241654bf097afb00fc5f054a09b687dad862e485fdcf8399bb056565370"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "der-parser"
 version = "10.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3384,12 +3475,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dotenvy"
-version = "0.15.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
-
-[[package]]
 name = "downcast"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3439,6 +3524,18 @@ checksum = "e079f19b08ca6239f47f8ba8509c11cf3ea30095831f7fed61441475edd8c449"
 dependencies = [
  "serde",
 ]
+
+[[package]]
+name = "embedded-io"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef1a6892d9eef45c8fa6b9e0086428a2cca8491aca8f787c534a3d6d0bcb3ced"
+
+[[package]]
+name = "embedded-io"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
 name = "encode_unicode"
@@ -3887,9 +3984,9 @@ dependencies = [
 
 [[package]]
 name = "gardal"
-version = "0.0.1-alpha.9"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aee8cfaab5bff357684bf9396842bdc2985f9fc25ce9a56ec1bce7ccb8c6318b"
+checksum = "c163717d8341c7727d807d35331c88357ddb8a1c70bea59024f876228bac3057"
 dependencies = [
  "futures",
  "likely_stable",
@@ -4011,7 +4108,7 @@ dependencies = [
  "hmac",
  "http",
  "jiff",
- "jsonwebtoken 11.1.0",
+ "jsonwebtoken",
  "reqwest",
  "rustc_version",
  "rustls",
@@ -4700,6 +4797,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "instability"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c3b5acc1e2fd9375041a388da33d1eb8aed5f7a8c0dd3543e3ea2805adfbe20"
+dependencies = [
+ "darling 0.24.1",
+ "indoc",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
+]
+
+[[package]]
 name = "inventory"
 version = "0.3.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5042,24 +5152,6 @@ dependencies = [
 
 [[package]]
 name = "jsonwebtoken"
-version = "10.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eba32bfb4ffdeaca3e34431072faf01745c9b26d25504aa7a6cf5684334fc4fc"
-dependencies = [
- "aws-lc-rs",
- "base64 0.22.1",
- "getrandom 0.2.17",
- "js-sys",
- "pem 3.0.6",
- "serde",
- "serde_json",
- "signature",
- "simple_asn1",
- "zeroize",
-]
-
-[[package]]
-name = "jsonwebtoken"
 version = "11.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e75fe14a82d81e5f5af639997db37d8b96045938a7ac6ab18cdbe1c7467e05e1"
@@ -5074,6 +5166,17 @@ dependencies = [
  "signature",
  "simple_asn1",
  "zeroize",
+]
+
+[[package]]
+name = "kasuari"
+version = "0.4.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72f14c90e40a6133f4805b83542a7ed7364f56070b447f56e7f4e90297122209"
+dependencies = [
+ "hashbrown 0.17.1",
+ "portable-atomic",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -5277,9 +5380,9 @@ dependencies = [
 
 [[package]]
 name = "libz-sys"
-version = "1.1.31"
+version = "1.1.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff20308ecabd635a2dc1dd5834a86c462cca20efba1d5d3ddab1f8aea3455cb2"
+checksum = "fee3f59f4321dab0c78d828942e7aa09d0bd8ad6e78a501977e6bf3d02938045"
 dependencies = [
  "cc",
  "libc",
@@ -5294,6 +5397,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d61f7017d8abea1fc23ff7f01a8147b2656dea3aeb24d519aab6e2177eaf671c"
 dependencies = [
  "rustc_version",
+]
+
+[[package]]
+name = "line-clipping"
+version = "0.3.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e752191d037c44ad111a8caa762921926658402f01cc1253f7bef2020ece4f5e"
+dependencies = [
+ "bitflags 2.13.2",
 ]
 
 [[package]]
@@ -5388,6 +5500,15 @@ dependencies = [
  "scoped-tls",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "lru"
+version = "0.18.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef9ac18847474e638e3702b76c65d4eb93428471a74778ef0f1be711717f89b5"
+dependencies = [
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -5610,12 +5731,6 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
-
-[[package]]
-name = "mnemonic"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2b8f3a258db515d5e91a904ce4ae3f73e091149b90cadbdb93d210bee07f63b"
 
 [[package]]
 name = "mock-service-endpoint"
@@ -6058,48 +6173,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "octocrab"
-version = "0.54.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8486ecb1ba585c76dd91472320b5334e95d0d2e8b451a3f0a3fced4415ec3993"
-dependencies = [
- "arc-swap",
- "base64 0.22.1",
- "bytes",
- "cargo_metadata",
- "cfg-if",
- "chrono",
- "futures",
- "futures-core",
- "futures-util",
- "getrandom 0.2.17",
- "http",
- "http-body",
- "http-body-util",
- "http-serde",
- "hyper",
- "hyper-rustls",
- "hyper-timeout",
- "hyper-util",
- "jsonwebtoken 10.4.0",
- "percent-encoding",
- "pin-project",
- "rustls",
- "secrecy",
- "serde",
- "serde_json",
- "serde_path_to_error",
- "serde_urlencoded",
- "snafu",
- "tokio",
- "tower",
- "tower-http 0.6.11",
- "tracing",
- "url",
- "web-time",
-]
-
-[[package]]
 name = "oid-registry"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6286,6 +6359,39 @@ checksum = "30d5b2194ed13191c1999ae0704b7839fb18384fa22e49b57eeaa97d79ce40da"
 dependencies = [
  "libc",
  "winapi",
+]
+
+[[package]]
+name = "palette"
+version = "0.7.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ddeed8580d347d2abf3dcf06a5f0b3dc020258338526b277847cd4248a70fc64"
+dependencies = [
+ "approx",
+ "libm",
+ "palette_derive",
+ "palette_math",
+]
+
+[[package]]
+name = "palette_derive"
+version = "0.7.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88537020289b719d81be994ccf1bbf4990f477e2f69ee52fe3e45f43a02e56be"
+dependencies = [
+ "by_address",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "palette_math"
+version = "0.7.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e6eb142958d64335fb0e345c5b9ead2ecd6fc438c307e9d7d3c4fd428dbaf12"
+dependencies = [
+ "libm",
 ]
 
 [[package]]
@@ -6491,6 +6597,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "10ab3eb7f3becc3a1cbc4f2c6f20267996cfc1a6467a873763411b136a122715"
 dependencies = [
  "portable-atomic",
+]
+
+[[package]]
+name = "postcard"
+version = "1.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6764c3b5dd454e283a30e6dfe78e9b31096d9e32036b5d1eaac7a6119ccb9a24"
+dependencies = [
+ "cobs",
+ "embedded-io 0.4.0",
+ "embedded-io 0.6.1",
+ "serde",
 ]
 
 [[package]]
@@ -6733,7 +6851,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph",
@@ -6754,7 +6872,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -7169,6 +7287,73 @@ dependencies = [
 ]
 
 [[package]]
+name = "ratatui"
+version = "0.30.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3274ba0a2c5e1bcad2a2005d20f4dc59dad26b2eb0940fb094500dba4099d57d"
+dependencies = [
+ "instability",
+ "ratatui-core",
+ "ratatui-crossterm",
+ "ratatui-widgets",
+ "serde",
+]
+
+[[package]]
+name = "ratatui-core"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cbb175c433c8e28a809d1f5773a2ae96e68c0ce40db865cbab1020bf33ae479c"
+dependencies = [
+ "bitflags 2.13.2",
+ "compact_str 0.9.1",
+ "critical-section",
+ "hashbrown 0.17.1",
+ "itertools 0.14.0",
+ "kasuari",
+ "lru",
+ "palette",
+ "serde",
+ "strum",
+ "thiserror 2.0.20",
+ "unicode-segmentation",
+ "unicode-truncate",
+ "unicode-width",
+]
+
+[[package]]
+name = "ratatui-crossterm"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "567584a3b0e6a8203c23de40b4861497266725eb5363dbfd18a1edd603cca9f0"
+dependencies = [
+ "cfg-if",
+ "crossterm",
+ "instability",
+ "ratatui-core",
+]
+
+[[package]]
+name = "ratatui-widgets"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66e3d19bcc9130ca376277d93b60767ff121ace3be06f5f95f81dd68956407d1"
+dependencies = [
+ "bitflags 2.13.2",
+ "hashbrown 0.17.1",
+ "indoc",
+ "instability",
+ "itertools 0.14.0",
+ "line-clipping",
+ "ratatui-core",
+ "serde",
+ "strum",
+ "time",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
 name = "raw-cpuid"
 version = "11.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7449,6 +7634,7 @@ dependencies = [
  "restate-admin-rest-model",
  "restate-bifrost",
  "restate-core",
+ "restate-distributed-datafusion",
  "restate-errors",
  "restate-ingestion-client",
  "restate-limiter",
@@ -7457,6 +7643,7 @@ dependencies = [
  "restate-serde-util",
  "restate-service-client",
  "restate-service-protocol-v4",
+ "restate-storage-query-api",
  "restate-storage-query-datafusion",
  "restate-types",
  "restate-util-string",
@@ -7604,6 +7791,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "bm25",
+ "bs58",
  "bytes",
  "chrono",
  "chrono-humanize",
@@ -7620,6 +7808,7 @@ dependencies = [
  "figment",
  "futures",
  "hickory-resolver",
+ "hostname",
  "http",
  "humantime",
  "hyper",
@@ -7629,9 +7818,6 @@ dependencies = [
  "indoc",
  "itertools 0.15.0",
  "json-patch",
- "mnemonic",
- "mock-service-endpoint",
- "octocrab",
  "open",
  "rand 0.10.2",
  "reqwest",
@@ -7642,6 +7828,7 @@ dependencies = [
  "restate-limiter",
  "restate-lite",
  "restate-serde-util",
+ "restate-test-util",
  "restate-types",
  "restate-util-string",
  "restate-util-time",
@@ -7681,7 +7868,6 @@ dependencies = [
  "crossterm",
  "dialoguer",
  "dirs",
- "dotenvy",
  "lambda_runtime",
  "restate-test-util",
  "restate-types",
@@ -7725,7 +7911,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "jsonwebtoken 11.1.0",
+ "jsonwebtoken",
  "restate-workspace-hack",
  "serde",
  "thiserror 2.0.20",
@@ -7810,6 +7996,58 @@ dependencies = [
 ]
 
 [[package]]
+name = "restate-distributed-datafusion"
+version = "1.8.2-dev"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "async-trait",
+ "bilrost",
+ "bytes",
+ "codederror",
+ "dashmap",
+ "datafusion",
+ "datafusion-distributed",
+ "datafusion-functions-json",
+ "datafusion-proto",
+ "derive_more",
+ "futures",
+ "gardal",
+ "googletest",
+ "http",
+ "prost",
+ "restate-clock",
+ "restate-core",
+ "restate-encoding",
+ "restate-limiter",
+ "restate-memory",
+ "restate-metadata-store",
+ "restate-partition-store",
+ "restate-platform",
+ "restate-rocksdb",
+ "restate-service-protocol",
+ "restate-service-protocol-v4",
+ "restate-sharding",
+ "restate-storage-api",
+ "restate-storage-query-api",
+ "restate-storage-query-datafusion",
+ "restate-types",
+ "restate-util-sql",
+ "restate-util-string",
+ "restate-worker-api",
+ "restate-workspace-hack",
+ "schemars 1.2.2",
+ "serde_json",
+ "strum",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "restate-doctor"
 version = "1.8.2-dev"
 dependencies = [
@@ -7842,10 +8080,12 @@ dependencies = [
  "restate-partition-store",
  "restate-rocksdb",
  "restate-storage-api",
+ "restate-storage-query-api",
  "restate-storage-query-datafusion",
  "restate-types",
  "restate-util-bytecount",
  "restate-wal-protocol",
+ "restate-worker-api",
  "restate-workspace-hack",
  "rlimit",
  "rust-rocksdb",
@@ -7861,6 +8101,7 @@ dependencies = [
  "ulid",
  "url",
  "vergen-gitcl",
+ "zerocopy",
 ]
 
 [[package]]
@@ -7895,16 +8136,6 @@ dependencies = [
  "test-log",
  "thiserror 2.0.20",
  "tracing",
-]
-
-[[package]]
-name = "restate-fs-util"
-version = "1.8.2-dev"
-dependencies = [
- "restate-workspace-hack",
- "tokio",
- "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -8160,7 +8391,6 @@ dependencies = [
  "reqwest",
  "restate-clock",
  "restate-core",
- "restate-metadata-providers",
  "restate-metadata-server-grpc",
  "restate-metadata-store",
  "restate-test-util",
@@ -8192,6 +8422,7 @@ dependencies = [
  "codederror",
  "derive_more",
  "googletest",
+ "libc",
  "metrics",
  "parking_lot",
  "prost",
@@ -8401,6 +8632,7 @@ dependencies = [
  "restate-admin",
  "restate-bifrost",
  "restate-core",
+ "restate-distributed-datafusion",
  "restate-futures-util",
  "restate-ingestion-client",
  "restate-ingress-http",
@@ -8414,6 +8646,7 @@ dependencies = [
  "restate-rocksdb",
  "restate-service-client",
  "restate-service-protocol-v4",
+ "restate-storage-query-api",
  "restate-storage-query-datafusion",
  "restate-tracing-instrumentation",
  "restate-types",
@@ -8459,6 +8692,7 @@ version = "1.8.2-dev"
 dependencies = [
  "ahash",
  "anyhow",
+ "async-trait",
  "bilrost",
  "bytes",
  "bytestring",
@@ -8468,7 +8702,9 @@ dependencies = [
  "enum-map",
  "futures",
  "futures-util",
+ "gardal",
  "googletest",
+ "itertools 0.15.0",
  "jiff",
  "metrics",
  "num-bigint 0.5.1",
@@ -8489,6 +8725,7 @@ dependencies = [
  "restate-rocksdb",
  "restate-service-protocol-v4",
  "restate-storage-api",
+ "restate-storage-query-api",
  "restate-test-util",
  "restate-types",
  "restate-util-bytecount",
@@ -8501,6 +8738,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
+ "smallvec",
  "static_assertions",
  "strum",
  "tempfile",
@@ -8512,6 +8750,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "zerocopy",
 ]
 
 [[package]]
@@ -8535,13 +8774,17 @@ name = "restate-rocksdb"
 version = "1.8.2-dev"
 dependencies = [
  "anyhow",
+ "async-channel",
  "bytes",
  "codederror",
+ "criterion",
  "derive_builder",
  "derive_more",
  "enum-map",
+ "futures",
  "metrics",
  "parking_lot",
+ "pin-project-lite",
  "restate-core",
  "restate-errors",
  "restate-futures-util",
@@ -8559,7 +8802,6 @@ dependencies = [
  "static_assertions",
  "strum",
  "thiserror 2.0.20",
- "threadpool",
  "tikv-jemalloc-sys",
  "tokio",
  "tokio-util",
@@ -8596,7 +8838,6 @@ dependencies = [
  "http",
  "http-body-util",
  "mock-service-endpoint",
- "octocrab",
  "rand 0.10.2",
  "rcgen",
  "regex",
@@ -8666,7 +8907,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
- "jsonwebtoken 11.1.0",
+ "jsonwebtoken",
  "metrics",
  "moka",
  "parking_lot",
@@ -8699,7 +8940,6 @@ name = "restate-service-protocol"
 version = "1.8.2-dev"
 dependencies = [
  "bytes",
- "bytes-utils",
  "codederror",
  "googletest",
  "paste",
@@ -8773,6 +9013,7 @@ dependencies = [
  "bytes",
  "bytestring",
  "derive_more",
+ "enum-map",
  "futures",
  "opentelemetry",
  "prost",
@@ -8789,6 +9030,31 @@ dependencies = [
  "serde_with",
  "strum",
  "thiserror 2.0.20",
+ "zerocopy",
+]
+
+[[package]]
+name = "restate-storage-query-api"
+version = "1.8.2-dev"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "datafusion",
+ "enum-map",
+ "futures",
+ "gardal",
+ "http",
+ "paste",
+ "restate-clock",
+ "restate-platform",
+ "restate-storage-api",
+ "restate-types",
+ "restate-util-string",
+ "restate-workspace-hack",
+ "strum",
+ "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]
@@ -8799,6 +9065,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.23.1",
+ "bilrost",
  "bytes",
  "bytestring",
  "codederror",
@@ -8816,16 +9083,20 @@ dependencies = [
  "paste",
  "prost",
  "prost-types",
+ "restate-clock",
  "restate-core",
  "restate-limiter",
  "restate-metadata-store",
  "restate-partition-store",
+ "restate-platform",
  "restate-rocksdb",
  "restate-service-protocol",
  "restate-service-protocol-v4",
  "restate-sharding",
  "restate-storage-api",
+ "restate-storage-query-api",
  "restate-types",
+ "restate-util-sql",
  "restate-util-string",
  "restate-worker-api",
  "restate-workspace-hack",
@@ -8835,6 +9106,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tracing",
 ]
 
@@ -9074,11 +9346,10 @@ dependencies = [
 name = "restate-util-string"
 version = "1.8.2-dev"
 dependencies = [
- "ahash",
  "bilrost",
  "bytes",
  "bytestring",
- "compact_str",
+ "compact_str 0.10.0",
  "criterion",
  "hashbrown 0.17.1",
  "metrics",
@@ -9180,8 +9451,8 @@ dependencies = [
 
 [[package]]
 name = "restate-web-ui"
-version = "1.1.3"
-source = "git+https://github.com/restatedev/restate-web-ui-crate?tag=v1.1.3#87c6f2696f8c9e91290534cf94376b567e8acadb"
+version = "1.1.6"
+source = "git+https://github.com/restatedev/restate-web-ui-crate?tag=v1.1.6#bfa061ee3b91c6b8ffb79863047d275081cb1916"
 
 [[package]]
 name = "restate-worker"
@@ -9210,7 +9481,6 @@ dependencies = [
  "restate-errors",
  "restate-futures-util",
  "restate-ingestion-client",
- "restate-ingress-http",
  "restate-ingress-kafka",
  "restate-invoker-impl",
  "restate-limiter",
@@ -9223,6 +9493,7 @@ dependencies = [
  "restate-service-protocol",
  "restate-service-protocol-v4",
  "restate-storage-api",
+ "restate-storage-query-api",
  "restate-storage-query-datafusion",
  "restate-test-util",
  "restate-timer",
@@ -9264,7 +9535,9 @@ dependencies = [
  "restate-futures-util",
  "restate-limiter",
  "restate-memory",
+ "restate-partition-store",
  "restate-storage-api",
+ "restate-storage-query-api",
  "restate-types",
  "restate-util-string",
  "restate-workspace-hack",
@@ -9308,17 +9581,24 @@ dependencies = [
  "chrono",
  "clap",
  "clap_builder",
- "compact_str",
+ "compact_str 0.10.0",
  "crc32fast",
  "criterion",
  "crossbeam-epoch",
  "crossbeam-utils",
  "dashmap",
+ "datafusion",
  "datafusion-common",
+ "datafusion-datasource",
+ "datafusion-datasource-arrow",
+ "datafusion-datasource-csv",
+ "datafusion-datasource-json",
  "datafusion-expr",
  "datafusion-functions",
+ "datafusion-functions-nested",
  "datafusion-physical-expr",
  "datafusion-physical-expr-common",
+ "datafusion-physical-plan",
  "datafusion-sql",
  "deranged",
  "derive_more",
@@ -9339,7 +9619,6 @@ dependencies = [
  "futures-sink",
  "futures-util",
  "gardal",
- "getrandom 0.2.17",
  "getrandom 0.3.4",
  "getrandom 0.4.3",
  "half",
@@ -9354,6 +9633,7 @@ dependencies = [
  "hyper-util",
  "indexmap 2.14.2",
  "ipnet",
+ "itertools 0.13.0",
  "itertools 0.14.0",
  "itertools 0.15.0",
  "jemalloc_pprof",
@@ -9404,6 +9684,7 @@ dependencies = [
  "serde_json",
  "serde_with",
  "simd-adler32",
+ "sketches-ddsketch",
  "slab",
  "smallvec",
  "sqlparser",
@@ -9426,7 +9707,6 @@ dependencies = [
  "toml_writer",
  "tonic",
  "tower",
- "tower-http 0.6.11",
  "tower-http 0.7.1",
  "tracing",
  "tracing-core",
@@ -9439,9 +9719,10 @@ dependencies = [
  "uuid",
  "winnow 1.0.4",
  "xxhash-rust",
- "zerocopy",
  "zeroize",
  "zlib-rs",
+ "zstd 0.13.4",
+ "zstd-safe 7.4.0",
  "zstd-sys",
 ]
 
@@ -9452,6 +9733,7 @@ dependencies = [
  "anyhow",
  "arrow",
  "assert2",
+ "base64 0.23.1",
  "bytes",
  "bytesize",
  "chrono",
@@ -9463,33 +9745,30 @@ dependencies = [
  "ctrlc",
  "diff",
  "futures",
- "futures-util",
  "googletest",
  "humantime",
  "itertools 0.15.0",
  "json-patch",
+ "prost",
  "prost-types",
  "rand 0.10.2",
- "restate-bifrost",
+ "ratatui",
  "restate-cli-util",
  "restate-clock",
  "restate-core",
  "restate-futures-util",
  "restate-local-cluster-runner",
  "restate-log-server-grpc",
- "restate-metadata-server",
+ "restate-memory",
  "restate-metadata-server-grpc",
  "restate-metadata-store",
- "restate-rocksdb",
+ "restate-test-util",
  "restate-types",
  "restate-util-time",
- "restate-wal-protocol",
  "restate-workspace-hack",
- "rlimit",
  "rustls",
  "serde",
  "serde_json",
- "tempfile",
  "test-log",
  "thiserror 2.0.20",
  "tokio",
@@ -9497,6 +9776,7 @@ dependencies = [
  "tonic",
  "tracing",
  "vergen-gitcl",
+ "zstd 0.14.3",
 ]
 
 [[package]]
@@ -9647,9 +9927,9 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.5"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags 2.13.2",
  "errno",
@@ -9872,15 +10152,6 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
-
-[[package]]
-name = "secrecy"
-version = "0.10.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
-dependencies = [
- "zeroize",
-]
 
 [[package]]
 name = "security-framework"
@@ -10256,6 +10527,9 @@ name = "sketches-ddsketch"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c6f73aeb92d671e0cc4dca167e59b2deb6387c375391bc99ee743f326994a2b"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "slab"
@@ -10365,27 +10639,6 @@ dependencies = [
  "autocfg",
  "static_assertions",
  "version_check",
-]
-
-[[package]]
-name = "snafu"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e84b3f4eacbf3a1ce05eac6763b4d629d60cbc94d632e4092c54ade71f1e1a2"
-dependencies = [
- "snafu-derive",
-]
-
-[[package]]
-name = "snafu-derive"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -10621,7 +10874,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -10739,15 +10992,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "threadpool"
-version = "1.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d050e60b33d41c19108b32cea32164033a9013fe3b46cbd4457559bfbf77afaa"
-dependencies = [
- "num_cpus",
 ]
 
 [[package]]
@@ -11162,7 +11406,6 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
- "tracing",
  "url",
 ]
 
@@ -11472,6 +11715,17 @@ name = "unicode-segmentation"
 version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
+
+[[package]]
+name = "unicode-truncate"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16b380a1238663e5f8a691f9039c73e1cdae598a30e9855f541d29b08b53e9a5"
+dependencies = [
+ "itertools 0.14.0",
+ "unicode-segmentation",
+ "unicode-width",
+]
 
 [[package]]
 name = "unicode-width"
@@ -11786,7 +12040,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
- "serde",
  "wasm-bindgen",
 ]
 
@@ -12152,7 +12405,7 @@ dependencies = [
  "restate-metadata-server",
  "restate-service-client",
  "restate-service-protocol-v4",
- "restate-storage-query-datafusion",
+ "restate-storage-query-api",
  "restate-types",
  "restate-worker",
  "restate-workspace-hack",

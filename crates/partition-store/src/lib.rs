@@ -8,35 +8,53 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+#![doc = include_str!("../README.md")]
+
+pub mod blob_table;
+mod budgeted_reads;
+mod compaction_filter;
 pub mod deduplication_table;
 mod durable_lsn_tracking;
 pub mod error;
-mod faults;
+pub mod faults;
 mod features;
 pub mod fsm_table;
 pub mod inbox_table;
+pub mod index;
 pub mod invocation_status_table;
+pub mod job;
 pub mod journal_events;
+pub mod journal_scan;
 pub mod journal_table;
 pub mod journal_table_v2;
 pub mod keys;
 pub mod locks_table;
+pub mod lookup;
 mod memory;
 mod metric_definitions;
 pub mod migrations;
+mod offloaded_reads;
+pub mod ordered_runs;
 pub mod outbox_table;
 mod owned_iter;
 mod partition_db;
 mod partition_store;
 mod partition_store_manager;
+mod partition_store_snapshot;
+pub mod population;
 pub mod promise_table;
+pub mod query_read;
 mod read_snapshot;
+pub mod registry;
 pub mod scan;
 pub mod service_status_table;
 pub mod snapshots;
 pub mod state_table;
+pub mod stats;
+pub mod table;
 pub mod timer_table;
 pub mod vqueue_table;
+pub mod walk;
 
 #[cfg(test)]
 mod tests;
@@ -44,9 +62,14 @@ mod tests;
 pub use error::*;
 pub use journal_table_v2::{OrphanCleanupResult, cleanup_orphaned_completion_id_index_entries};
 pub use migrations::{MigrationError, migrate_to_locks_table};
-pub use partition_db::PartitionDb;
+pub use partition_db::{DroppedPartitionStore, PartitionDb};
 pub use partition_store::*;
 pub use partition_store_manager::*;
+pub use partition_store_snapshot::PartitionStoreSnapshot;
+pub use query_read::{
+    IndexSizes, MigrationReport, QueryIoExecutor, ReadSnapshot, ReplicaMigrations,
+    UnreadableReplica,
+};
 pub use read_snapshot::{PartitionReadSnapshot, PartitionSnapshotReader, PartitionSnapshotScan};
 // re-export
 pub use restate_rocksdb::Priority;

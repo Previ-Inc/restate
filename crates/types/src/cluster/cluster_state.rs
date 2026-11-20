@@ -216,6 +216,37 @@ pub struct PartitionProcessorStatus {
     #[into_prost(map = "enabled_storage_features_to_proto")]
     #[bilrost(19)]
     pub enabled_storage_features: Vec<ReString>,
+    /// The LSN of the record that turned byte offsets on for the partition, which they count
+    /// from. `None` while the partition doesn't track byte offsets.
+    ///
+    /// Since v1.8.2
+    #[bilrost(20)]
+    pub byte_offsets_base_lsn: Option<Lsn>,
+    /// How far the partition processor has applied its log in bytes. Replicas at the same applied
+    /// LSN normally agree on it, but it can differ slightly between them. `None` while the
+    /// partition doesn't track byte offsets.
+    ///
+    /// Since v1.8.2
+    #[bilrost(21)]
+    pub log_byte_offset: Option<u64>,
+    /// How far the partition processor has written its partition store in bytes. Local to this
+    /// replica's store. `None` while the partition doesn't track byte offsets.
+    ///
+    /// Since v1.8.2
+    #[bilrost(22)]
+    pub partition_store_byte_offset: Option<u64>,
+    /// The log byte offset of the snapshot at [`Self::last_archived_log_lsn`], if it recorded
+    /// one. A replica's log byte offset minus this one, when both count from the same base LSN,
+    /// tells how much of the log lies between the snapshot and the replica.
+    ///
+    /// Since v1.8.2
+    #[bilrost(23)]
+    pub last_archived_log_byte_offset: Option<u64>,
+    /// The LSN that [`Self::last_archived_log_byte_offset`] counts from.
+    ///
+    /// Since v1.8.2
+    #[bilrost(24)]
+    pub last_archived_byte_offsets_base_lsn: Option<Lsn>,
 }
 
 impl PartitionProcessorStatus {
@@ -281,6 +312,11 @@ impl Default for PartitionProcessorStatus {
             enabled_features: PersistedFeatures::default(),
             broken_reason: BrokenReason::NotBroken,
             enabled_storage_features: Vec::new(),
+            byte_offsets_base_lsn: None,
+            log_byte_offset: None,
+            partition_store_byte_offset: None,
+            last_archived_log_byte_offset: None,
+            last_archived_byte_offsets_base_lsn: None,
         }
     }
 }

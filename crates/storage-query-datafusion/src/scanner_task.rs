@@ -8,14 +8,16 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use anyhow::Context;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
-use datafusion::physical_plan::PhysicalExpr;
 use datafusion::physical_plan::metrics::Time;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt as TokioStreamExt;
@@ -24,17 +26,34 @@ use tracing::{debug, warn};
 use restate_core::network::{Oneshot, Reciprocal};
 use restate_core::{TaskCenter, TaskKind};
 use restate_types::GenerationalNodeId;
+use restate_types::config::Configuration;
 use restate_types::net::remote_query_scanner::{
     RemoteQueryScannerNextResult, RemoteQueryScannerOpen, RemoteQueryScannerPredicate,
     ScannerBatch, ScannerFailure, ScannerId,
 };
 
-use crate::context::QueryContext;
 use crate::remote_query_scanner_manager::RemoteScannerManager;
 use crate::remote_query_scanner_server::ScannerMap;
-use crate::{decode_expr, decode_schema, encode_record_batch};
+use crate::table_providers::ScanPredicate;
+use crate::{decode_expr, decode_schema, encode_next};
 
 const SCANNER_EXPIRATION: Duration = Duration::from_secs(60);
+
+/// Room left in each response for the message envelope around the encoded batch:
+/// the fabric header, the scanner ID and framing. They take far less than this.
+const ENVELOPE_ROOM: usize = 64 * 1024;
+
+/// The most bytes one encoded batch may take in a remote-scan response, so that
+/// the whole response stays within `networking.message-size-limit`. Receivers
+/// reject larger messages, and that drops their connection to this node.
+fn batch_budget() -> usize {
+    let limit = Configuration::pinned()
+        .networking
+        .message_size_limit
+        .as_non_zero_usize()
+        .get();
+    limit - ENVELOPE_ROOM.min(limit / 2)
+}
 
 pub(crate) struct NextRequest {
     pub reciprocal: Reciprocal<Oneshot<RemoteQueryScannerNextResult>>,
@@ -53,13 +72,18 @@ pub(crate) struct ScannerTask {
     ctx: Arc<TaskContext>,
     schema: SchemaRef,
     dynamic_filter: Option<Arc<DynamicFilterPhysicalExpr>>,
+    /// Row slices of a batch too large for one response, in row order. Each is
+    /// encoded when a `next` request asks for it; see [`encode_next`].
+    pending: VecDeque<RecordBatch>,
+    /// The most bytes one response's batch may take; see [`batch_budget`].
+    batch_budget: usize,
 }
 
 impl ScannerTask {
     /// Spawns the scanner task and registers the scanner in the scanners map.
     pub fn spawn(
         scanner_id: ScannerId,
-        query_context: &QueryContext,
+        ctx: Arc<TaskContext>,
         remote_scanner_manager: &RemoteScannerManager,
         peer: GenerationalNodeId,
         scanners: &Arc<ScannerMap>,
@@ -69,26 +93,21 @@ impl ScannerTask {
             .local_partition_scanner(&request.table)
             .context("not registered scanner for a table")?;
         let schema = decode_schema(&request.projection_schema_bytes).context("bad schema bytes")?;
-        let ctx = query_context.task_ctx();
 
-        let predicate = request
+        let initial = request
             .predicate
             .map(|predicate| decode_expr(&ctx, &schema, &predicate.serialized_physical_expression))
             .transpose()?;
 
         let schema = Arc::new(schema);
 
-        let dynamic_filter = predicate
-            .as_ref()
-            .map(|pred| Arc::new(DynamicFilterPhysicalExpr::new(Vec::new(), Arc::clone(pred))));
+        let (predicate, dynamic_filter) = initial.map(ScanPredicate::updatable).unzip();
 
         let stream = scanner.scan_partition(
             request.partition_id,
             request.range,
             schema.clone(),
-            dynamic_filter
-                .as_ref()
-                .map(|filter| filter.clone() as Arc<dyn PhysicalExpr>),
+            predicate,
             usize::try_from(request.batch_size).expect("batch_size to fit in a usize"),
             request
                 .limit
@@ -106,6 +125,8 @@ impl ScannerTask {
             ctx,
             schema,
             dynamic_filter,
+            pending: VecDeque::new(),
+            batch_budget: batch_budget(),
         };
 
         scanners.insert(scanner_id, tx);
@@ -176,29 +197,38 @@ impl ScannerTask {
                 return;
             }
 
-            // The filtering is now done by FilterCoalesceStream inside scan_partition,
-            // so we just need to get the next batch from the stream.
-            let record_batch = match self.stream.next().await {
-                Some(Ok(record_batch)) => record_batch,
-                Some(Err(e)) => {
-                    warn!("Error while scanning {}: {e}", self.scanner_id);
-                    request
-                        .reciprocal
-                        .send(RemoteQueryScannerNextResult::Failure(ScannerFailure {
-                            scanner_id: self.scanner_id,
-                            message: e.to_string(),
-                        }));
-                    return;
-                }
-                None => {
-                    request
-                        .reciprocal
-                        .send(RemoteQueryScannerNextResult::NoMoreRecords(self.scanner_id));
-                    return;
-                }
+            // Slices of a batch that was too large for one response go first.
+            let record_batch = match self.pending.pop_front() {
+                Some(slice) => slice,
+                // The filtering is now done by FilterCoalesceStream inside scan_partition,
+                // so we just need to get the next batch from the stream.
+                None => match self.stream.next().await {
+                    Some(Ok(record_batch)) => record_batch,
+                    Some(Err(e)) => {
+                        warn!("Error while scanning {}: {e}", self.scanner_id);
+                        request
+                            .reciprocal
+                            .send(RemoteQueryScannerNextResult::Failure(ScannerFailure {
+                                scanner_id: self.scanner_id,
+                                message: failure_message(&e),
+                            }));
+                        return;
+                    }
+                    None => {
+                        request
+                            .reciprocal
+                            .send(RemoteQueryScannerNextResult::NoMoreRecords(self.scanner_id));
+                        return;
+                    }
+                },
             };
 
-            match encode_record_batch(&self.stream.schema(), record_batch) {
+            match encode_next(
+                &self.stream.schema(),
+                record_batch,
+                self.batch_budget,
+                &mut self.pending,
+            ) {
                 Ok(record_batch) => {
                     request
                         .reciprocal
@@ -213,7 +243,7 @@ impl ScannerTask {
                         .reciprocal
                         .send(RemoteQueryScannerNextResult::Failure(ScannerFailure {
                             scanner_id: self.scanner_id,
-                            message: e.to_string(),
+                            message: failure_message(&e),
                         }));
                     return;
                 }
@@ -222,10 +252,55 @@ impl ScannerTask {
     }
 }
 
+/// The message of a failed scan for the client, which reports it as a
+/// [`RemoteScanError::Failed`]. An error from outside DataFusion, such as a
+/// storage error, goes without DataFusion's `External error: ` prefix, which the
+/// client adds back once.
+///
+/// [`RemoteScanError::Failed`]: crate::remote_query_scanner_client::RemoteScanError::Failed
+fn failure_message(err: &DataFusionError) -> String {
+    match err {
+        DataFusionError::External(err) => err.to_string(),
+        err => err.to_string(),
+    }
+}
+
 impl Drop for ScannerTask {
     fn drop(&mut self) {
         if let Some(scanners) = self.scanners.upgrade() {
             let _ = scanners.remove(&self.scanner_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::error::DataFusionError;
+
+    use restate_types::NodeId;
+
+    use super::failure_message;
+    use crate::remote_query_scanner_client::RemoteScanError;
+
+    #[test]
+    fn remote_scan_failures_are_not_reported_as_datafusion_bugs() {
+        let not_complete = "'service_stats/1' is not complete on partition 12: no maintained index";
+        let storage = DataFusionError::External(anyhow::anyhow!(not_complete).into());
+        assert_eq!(failure_message(&storage), not_complete);
+
+        // The coordinator reports it as external once, and names the node.
+        let reported: DataFusionError = RemoteScanError::Failed {
+            peer: NodeId::new_plain(3),
+            message: failure_message(&storage),
+        }
+        .into();
+        assert_eq!(
+            reported.to_string(),
+            format!("External error: scan on N3 failed: {not_complete}")
+        );
+
+        // A DataFusion bug on the remote node keeps DataFusion's report.
+        let bug = DataFusionError::Internal("unexpected plan".to_owned());
+        assert!(failure_message(&bug).contains("bug in DataFusion"));
     }
 }

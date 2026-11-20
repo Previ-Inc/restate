@@ -8,36 +8,41 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+use std::collections::BTreeSet;
+use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 use std::ops::RangeBounds;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Once, OnceLock};
 use std::time::Duration;
 
 use anyhow::anyhow;
 use bytes::Bytes;
 use bytes::BytesMut;
 use enum_map::Enum;
+use metrics::Histogram;
 use rocksdb::{
-    BoundColumnFamily, DBPinnableSlice, DBRawIteratorWithThreadMode, ReadOptions,
-    SnapshotWithThreadMode,
+    AsColumnFamilyRef, BoundColumnFamily, DBPinnableSlice, DBRawIteratorWithThreadMode, ReadOptions,
 };
 use static_assertions::const_assert_eq;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use tracing::{Level, instrument, trace, warn};
 
 use restate_core::io::{AdmissionClosed, Gate, IoExecutor};
 use restate_futures_util::overdue::OverdueLoggingExt;
-use restate_rocksdb::{IoMode, IterAction, Priority, RocksDb, RocksDbManager, RocksError};
-use restate_storage_api::fsm_table::ReadFsmTable;
+use restate_rocksdb::reads::{OwnedPinnedValue, ReadIterator, ScopedReads};
+use restate_rocksdb::{
+    IoMode, IterAction, Priority, RocksDb, RocksDbManager, RocksError, StorageTaskKind,
+};
+use restate_storage_api::fsm_table::{FsmPosition, ReadFsmTable};
 use restate_storage_api::protobuf_types::{PartitionStoreProtobufValue, ProtobufStorageWrapper};
-use restate_storage_api::{IsolationLevel, Storage, StorageError, Transaction};
+use restate_storage_api::{Storage, StorageError, Transaction};
 use restate_types::SemanticRestateVersion;
-use restate_types::config::{Configuration, StorageOptions};
+use restate_types::config::{Configuration, WorkerOptions};
 use restate_types::identifiers::{PartitionId, PartitionKey, SnapshotId, WithPartitionKey};
 use restate_types::logs::{Lsn, SequenceNumber};
 use restate_types::partitions::Partition;
@@ -46,30 +51,38 @@ use restate_types::sharding::KeyRange;
 use restate_types::storage::StorageCodec;
 use restate_types::storage::StorageDecode;
 use restate_types::storage::StorageEncode;
+use restate_util_lifecycle::Scope;
 use restate_util_string::ReString;
 
+use crate::PartitionStoreSnapshot;
 use crate::features::{LoadedStorageFeatures, StorageFeatures};
+use crate::fsm_table::delete_applied_lsn;
 use crate::fsm_table::get_partition_seal;
+use crate::fsm_table::put_fsm_position;
 use crate::fsm_table::put_min_restate_version;
 use crate::fsm_table::put_storage_features;
 use crate::fsm_table::put_storage_version;
 use crate::fsm_table::seal_partition;
 use crate::fsm_table::{
-    get_locally_durable_lsn, get_min_restate_version_from_partition_db,
+    PartitionStateMachineKey, get_locally_durable_lsn, get_min_restate_version_from_partition_db,
     get_state_machine_features_from_partition_db, get_storage_features_from_partition_db,
     get_storage_version_from_partition_db, is_jc_orphan_cleanup_done, put_jc_orphan_cleanup_done,
 };
-use crate::keys::{EncodeTableKey, EncodeTableKeyPrefix, KeyKind};
+use crate::keys::{EncodeTableKey, EncodeTableKeyPrefix, FixedLengthTableKey, KeyKind};
 use crate::migrations::MigrationError;
-use crate::partition_db::PartitionDb;
+use crate::offloaded_reads::{OffloadedRead, call_cached_or_offload};
+use crate::partition_db::{PartitionDb, PhysicalPartition};
+use crate::registry::PublishedRegistry;
 use crate::scan::PhysicalScan;
 use crate::scan::TableScan;
 use crate::snapshots::{CaptureGuard, LocalPartitionSnapshot, SnapshotCompatibility, export_dir};
+use crate::stats::aggregated::AggregatedStatsMut;
 use crate::{configure_prefix_iterator_opts, configure_range_iterator_opts};
 
 pub type DB = rocksdb::DB;
 
-// Key kind and partition key are 10 bytes (KeyKind(2) + PartitionKey/Id(8))
+// Key kind and partition key are 10 bytes (KeyKind(2) + PartitionKey/Id(8)).
+// Statistics use a table-specific 8-byte suffix.
 pub(crate) const DB_PREFIX_LENGTH: usize =
     KeyKind::SERIALIZED_LENGTH + std::mem::size_of::<PartitionKey>();
 
@@ -183,6 +196,11 @@ pub enum TableKind {
     Promise,
     VQueue,
     Locks,
+    Blob,
+    SecondaryIndex,
+    Stats,
+    /// The registry, its walks and its migration jobs.
+    Registry,
 }
 
 impl TableKind {
@@ -217,6 +235,10 @@ impl TableKind {
                 KeyKind::VQueueInput,
             ],
             Self::Locks => &[KeyKind::Lock],
+            Self::Blob => &[KeyKind::Blob],
+            Self::SecondaryIndex => &[KeyKind::SecondaryIndex],
+            Self::Stats => &[KeyKind::Stats],
+            Self::Registry => &[KeyKind::Registry],
         }
     }
 
@@ -312,8 +334,54 @@ impl PartitionStore {
         })
     }
 
+    /// The published registry, with the indexes maintained on entry writes.
+    /// Opening the partition reconciles the registry and installs it before the
+    /// processor writes. A store used without that (tools and tests) loads its
+    /// records from disk on first use, with the configured retention for the
+    /// jobs that finish. Unreadable registry or walk records are a bug there,
+    /// and panic: writing with no indexes instead would skip the Complete indexes
+    /// and clear the entries' tokens, corrupting the indexes silently, and an open
+    /// would have failed on them.
+    pub(crate) fn published_registry(&self) -> Arc<PublishedRegistry> {
+        if let Some(published_registry) = self.db.published_registry() {
+            return published_registry;
+        }
+        let (records, _) =
+            crate::registry::records::load(self.partition_db()).unwrap_or_else(|err| {
+                panic!(
+                    "the registry records of partition {} are unreadable: {err}",
+                    self.partition_id()
+                )
+            });
+        let retention = Configuration::pinned()
+            .worker
+            .storage
+            .finished_migration_jobs_retention
+            .to_std();
+        let published_registry = Arc::new(
+            PublishedRegistry::new(
+                &records.registry.unwrap_or_default(),
+                &records.walks,
+                crate::registry::INDEX_DEFINITIONS,
+            )
+            .with_jobs(records.jobs, retention),
+        );
+        self.db
+            .install_published_registry(Arc::clone(&published_registry));
+        published_registry
+    }
+
+    /// Publishes `published_registry` to every handle of this partition, as opening
+    /// does after reconciling the registry. Tests publish indexes of test definitions.
+    #[cfg(test)]
+    #[allow(dead_code)] // Consumed when the registry is reconciled at open.
+    pub(crate) fn set_published_registry(&mut self, published_registry: PublishedRegistry) {
+        self.db
+            .install_published_registry(Arc::new(published_registry));
+    }
+
     /// Overwrites the memoized storage features after their finalization batch commits.
-    fn set_storage_features(&mut self, features: StorageFeatures) {
+    pub(crate) fn set_storage_features(&mut self, features: StorageFeatures) {
         self.storage_features.take();
         let _ = self.storage_features.set(features);
     }
@@ -333,6 +401,43 @@ impl PartitionStore {
 
     pub fn partition_key_range(&self) -> KeyRange {
         self.db.partition().key_range
+    }
+
+    /// Takes a read snapshot of the partition's tables. See [`PartitionStoreSnapshot`].
+    ///
+    /// Fails once the partition is closing or closed.
+    pub fn snapshot(&mut self) -> std::result::Result<PartitionStoreSnapshot<'_>, AdmissionClosed> {
+        let storage_features = self.storage_features();
+        let key_range = self.partition_key_range();
+        let snapshot = self.db.read_snapshot()?;
+        Ok(PartitionStoreSnapshot::new(
+            self.db.gate(),
+            snapshot,
+            &mut self.key_buffer,
+            storage_features,
+            key_range,
+        ))
+    }
+
+    /// Admits a read: captures a [`crate::ReadSnapshot`] of the store as it is
+    /// now, with its storage features and registry, and returns the future
+    /// that resolves once the snapshot's last holder (a clone, a cursor or a
+    /// storage job) has released it. The processor calls this in its loop, after
+    /// its readiness checks; `cancel` is the token that ends the read.
+    pub fn query_read(
+        &self,
+        cancel: CancellationToken,
+    ) -> Result<(crate::ReadSnapshot, WaitForCancellationFutureOwned)> {
+        let completed = CancellationToken::new();
+        Ok((
+            crate::ReadSnapshot::new(
+                self.db.clone(),
+                self.storage_features(),
+                cancel,
+                completed.clone(),
+            )?,
+            completed.cancelled_owned(),
+        ))
     }
 
     #[inline]
@@ -463,6 +568,72 @@ impl PartitionStore {
         self.iterator_for_each_physical(name, priority, opts, scan.into(), f)
     }
 
+    /// Looks up the keys of `ids` with batched multi-gets of up to `batch_size` keys on the
+    /// low-priority storage pool, and calls `f` in `ids` order for each id that has a value.
+    ///
+    /// `ids` must be ordered like their encoded keys, since the multi-get assumes sorted input.
+    pub(crate) fn multi_get_for_each<I, K, const N: usize>(
+        &self,
+        name: &'static str,
+        batch_size: NonZeroUsize,
+        ids: BTreeSet<I>,
+        to_key: impl Fn(&I) -> K + Send + 'static,
+        mut f: impl FnMut(&I, &[u8]) -> ControlFlow<Result<()>> + Send + 'static,
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        I: Send + 'static,
+        K: FixedLengthTableKey<N>,
+    {
+        let db = self.db.clone();
+        async move {
+            let read = db.prepare_read(name, StorageTaskKind::MultiGet, move |raw_db, cfs| {
+                let cf = cfs.get(K::KEY_KIND);
+                let batch_size = batch_size.get();
+
+                let batch_capacity = ids.len().min(batch_size);
+                let mut batch_ids = Vec::with_capacity(batch_capacity);
+                let mut keys = Vec::with_capacity(batch_capacity);
+
+                let mut readopts = ReadOptions::default();
+                // future proofing to make use of parallel L0 reads and async-io
+                // if/when we build rocksdb with COROUTINES=1 and IO-URING support.
+                // by default, this will not do anything.
+                readopts.set_async_io(true);
+                readopts.set_optimize_multiget_for_io(true);
+
+                let mut ids = ids.into_iter().peekable();
+                while ids.peek().is_some() {
+                    batch_ids.clear();
+                    keys.clear();
+                    for id in ids.by_ref().take(batch_size) {
+                        keys.push(to_key(&id).to_bytes());
+                        batch_ids.push(id);
+                    }
+
+                    let results = raw_db.batched_multi_get_cf_opt(cf, &keys, true, &readopts);
+
+                    for (id, result) in batch_ids.iter().zip(results) {
+                        let Some(value) = result.map_err(|e| StorageError::Generic(e.into()))?
+                        else {
+                            continue;
+                        };
+                        if let ControlFlow::Break(result) = f(id, &value) {
+                            return result;
+                        }
+                    }
+                }
+                Ok(())
+            });
+            db.rocksdb()
+                .executor()
+                .low_pri()
+                .spawn(read)
+                .map_err(|_| StorageError::OperationalError)?
+                .await
+                .map_err(|_| StorageError::OperationalError)?
+        }
+    }
+
     pub fn iterator_filter_map<K: EncodeTableKeyPrefix, O: Send + 'static>(
         &self,
         name: &'static str,
@@ -522,10 +693,6 @@ impl PartitionStore {
         Ok(())
     }
 
-    pub fn transaction(&mut self) -> PartitionStoreTransaction<'_> {
-        self.transaction_with_isolation(IsolationLevel::Committed)
-    }
-
     /// Returns a watch of the durably persisted applied LSN, or [`Lsn::INVALID`]
     /// when no durable position is known or the old column family has been removed.
     pub async fn get_durable_lsn(&mut self) -> Result<watch::Receiver<Lsn>> {
@@ -539,25 +706,17 @@ impl PartitionStore {
         Ok(rx)
     }
 
-    pub fn transaction_with_isolation(
-        &mut self,
-        isolation_level: IsolationLevel,
-    ) -> PartitionStoreTransaction<'_> {
+    pub fn transaction(&mut self) -> PartitionStoreTransaction<'_> {
         // An optimization to avoid looking up the cf handle everytime, if we split into more
         // column families, we will need to cache those cfs here as well.
         let data_cf_handle = self.db.cf_handle();
-        let snapshot = match isolation_level {
-            IsolationLevel::Committed => None,
-            IsolationLevel::RepeatableReads => {
-                Some(self.db.rocksdb().inner().as_raw_db().snapshot())
-            }
-        };
 
         // 99.9% of the time, this will return an already loaded value.
         // If PartitionStore.storage_features() was never called before,
         // this will fetch the value and cache it.
         let storage_features = self.storage_features();
-        let settings = TransactionSettings::from(&Configuration::pinned().worker.storage);
+        let published_registry = self.published_registry();
+        let settings = TransactionSettings::new(&Configuration::pinned().worker, storage_features);
 
         PartitionStoreTransaction {
             write_batch_with_index: Some(rocksdb::WriteBatchWithIndex::new(0, true)),
@@ -568,9 +727,14 @@ impl PartitionStore {
             value_buffer: &mut self.value_buffer,
             meta: self.db.partition(),
             storage_features,
-            snapshot,
+            published_registry,
             settings,
             commit_fence: None,
+            write_batch_size_histogram: None,
+            fsm_position: None,
+            fsm_position_pending: false,
+            #[cfg(any(test, feature = "faults"))]
+            faults: self.db.faults(),
         }
     }
 
@@ -608,6 +772,11 @@ impl PartitionStore {
             .map_err(|e| StorageError::SnapshotExport(e.into()))?;
 
         let compatibility = self.read_snapshot_compatibility();
+        let position = self
+            .get_fsm_position()
+            .await
+            .map_err(|e| StorageError::SnapshotExport(e.into()))?
+            .filter(FsmPosition::has_byte_offsets);
         // The export holds the capture until RocksDB is done, even if we stop waiting.
         //
         // It runs on the lifecycle pool, next to creating and importing partition stores, rather
@@ -646,6 +815,9 @@ impl PartitionStore {
             min_applied_lsn: applied_lsn,
             key_range: self.db.partition().key_range,
             compatibility,
+            byte_offsets_base_lsn: position.map(|p| p.byte_offsets_base_lsn),
+            log_byte_offset: position.map(|p| p.log_byte_offset),
+            partition_store_byte_offset: position.map(|p| p.partition_store_byte_offset),
         })
     }
 
@@ -761,6 +933,16 @@ impl PartitionStore {
             ));
         }
 
+        // An unsupported or invalid registry fails the open before any migration
+        // below mutates the store.
+        self.validate_registry(storage_features.enabled())?;
+
+        // Registered indexes replace the legacy status gauges. Delete them once
+        // every compatibility check above passed, before any family can be
+        // activated below.
+        self.remove_legacy_status_gauges(&mut storage_features)
+            .await?;
+
         // Changes might be empty, but storage_features can still be dirty due to the automatic
         // convergence that happens based on storage-version or if the store is empty.
         let features_to_enable =
@@ -781,6 +963,7 @@ impl PartitionStore {
                     &mut storage_features,
                 )
                 .await?;
+            self.set_storage_features(*storage_features.enabled());
         }
 
         if storage_features.is_dirty() {
@@ -788,6 +971,20 @@ impl PartitionStore {
             storage_features.mark_persisted();
         }
         self.set_storage_features(*storage_features.enabled());
+
+        // Before the processor starts writing: retire, reset and register
+        // indexes, start their walks, fence the store, and install the indexes
+        // maintained on writes.
+        self.reconcile_registry(
+            crate::registry::INDEX_DEFINITIONS,
+            &crate::registry::Requests::from_config(crate::registry::FAMILIES, config),
+            crate::registry::FenceState {
+                features: &mut storage_features,
+                current_version: current_restate_version,
+                min_restate_version: &mut current_min_restate_version,
+            },
+        )
+        .await?;
 
         // Keep StorageVersion aligned for older binaries that used it as the sole signal for these
         // migrations. The combined variant is accurate only when both features are enabled; a
@@ -827,27 +1024,39 @@ impl PartitionStore {
 impl Storage for PartitionStore {
     type TransactionType<'a> = PartitionStoreTransaction<'a>;
 
-    fn transaction_with_isolation(
-        &mut self,
-        read_isolation: IsolationLevel,
-    ) -> Self::TransactionType<'_> {
-        PartitionStore::transaction_with_isolation(self, read_isolation)
+    fn transaction(&mut self) -> Self::TransactionType<'_> {
+        PartitionStore::transaction(self)
     }
 }
 
-impl StorageAccess for PartitionStore {
-    type DBAccess<'a>
-        = DB
+impl StorageRead for PartitionStore {
+    type Iterator<'a>
+        = DBRawIteratorWithThreadMode<'a, DB>
     where
         Self: 'a;
 
     fn iterator_from<K: EncodeTableKeyPrefix>(
         &self,
         scan: TableScan<K>,
-    ) -> Result<DBRawIteratorWithThreadMode<'_, Self::DBAccess<'_>>> {
+    ) -> Result<Self::Iterator<'_>> {
         let mut opts = ReadOptions::default();
         opts.set_async_io(true);
         self.db.scan(scan.into(), opts)
+    }
+
+    #[inline]
+    fn get<K: AsRef<[u8]>>(
+        &self,
+        key_kind: KeyKind,
+        key: K,
+    ) -> Result<Option<DBPinnableSlice<'_>>> {
+        let cf = self.cf_for_key_kind(key_kind);
+        self.db
+            .rocksdb()
+            .inner()
+            .as_raw_db()
+            .get_pinned_cf(cf, key)
+            .map_err(|error| StorageError::Generic(error.into()))
     }
 
     #[inline]
@@ -856,40 +1065,32 @@ impl StorageAccess for PartitionStore {
         self.key_buffer.reserve(min_size);
         &mut self.key_buffer
     }
+}
 
+impl OffloadedRead for PartitionStore {
+    type Value = OwnedPinnedValue<Scope<PhysicalPartition>>;
+
+    fn get_cached_or_offload<'a>(
+        &'a self,
+        name: &'static str,
+        key_kind: KeyKind,
+        key: &'a [u8],
+        executor: &(impl IoExecutor + Sync),
+    ) -> Result<impl Future<Output = Result<Option<Self::Value>>> + Send + 'static> {
+        let read = self
+            .db
+            .physical_scope()
+            .prepare_get(self.db.gate(), key_kind, key);
+        call_cached_or_offload(read, name, executor)
+    }
+}
+
+impl StorageAccess for PartitionStore {
     #[inline]
     fn cleared_value_buffer_mut(&mut self, min_size: usize) -> &mut BytesMut {
         self.value_buffer.clear();
         self.value_buffer.reserve(min_size);
         &mut self.value_buffer
-    }
-
-    #[inline]
-    fn get<K: AsRef<[u8]>>(&self, table: TableKind, key: K) -> Result<Option<DBPinnableSlice<'_>>> {
-        let table = self.table_handle(table);
-        self.db
-            .rocksdb()
-            .inner()
-            .as_raw_db()
-            .get_pinned_cf(table, key)
-            .map_err(|error| StorageError::Generic(error.into()))
-    }
-
-    fn get_durable<K: AsRef<[u8]>>(
-        &self,
-        table: TableKind,
-        key: K,
-    ) -> Result<Option<DBPinnableSlice<'_>>> {
-        let table = self.table_handle(table);
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_read_tier(rocksdb::ReadTier::Persisted);
-
-        self.db
-            .rocksdb()
-            .inner()
-            .as_raw_db()
-            .get_pinned_cf_opt(table, key, &read_opts)
-            .map_err(|error| StorageError::Generic(error.into()))
     }
 
     #[inline]
@@ -957,14 +1158,20 @@ impl ScanMode {
 pub(crate) struct TransactionSettings {
     /// Probability that a vqueue metadata update is written as a full value instead of a merge.
     pub vqueue_meta_full_write_probability: f64,
+    /// Journal entries with a larger content store it in a blob, if set.
+    pub inline_entry_threshold: Option<usize>,
 }
 
-impl From<&StorageOptions> for TransactionSettings {
-    fn from(opts: &StorageOptions) -> Self {
+impl TransactionSettings {
+    pub fn new(opts: &WorkerOptions, storage_features: StorageFeatures) -> Self {
         Self {
             vqueue_meta_full_write_probability: opts
+                .storage
                 .vqueue_meta_full_write_probability
                 .clamp(0.0, 1.0),
+            inline_entry_threshold: storage_features
+                .is_journal_entry_blobs
+                .then(|| opts.inline_journal_entry_threshold.as_usize()),
         }
     }
 }
@@ -978,10 +1185,18 @@ pub struct PartitionStoreTransaction<'a> {
     key_buffer: &'a mut BytesMut,
     value_buffer: &'a mut BytesMut,
     storage_features: StorageFeatures,
-    snapshot: Option<SnapshotWithThreadMode<'a, rocksdb::DB>>,
+    published_registry: Arc<PublishedRegistry>,
     settings: TransactionSettings,
     /// Resolves once the [`CommitFence`] holding back commits is dropped.
     commit_fence: Option<oneshot::Receiver<()>>,
+    write_batch_size_histogram: Option<&'a Histogram>,
+    /// The partition's position, if this transaction maintains it.
+    fsm_position: Option<FsmPosition>,
+    /// Whether the next commit persists the position even if it has nothing else to write,
+    /// because the applied LSN advanced while only the position holds it.
+    fsm_position_pending: bool,
+    #[cfg(any(test, feature = "faults"))]
+    faults: &'a crate::faults::Faults,
 }
 
 /// Holds back the commits of the [`PartitionStoreTransaction`] that created it until dropped.
@@ -1012,6 +1227,66 @@ impl<'a> PartitionStoreTransaction<'a> {
         Some(CommitFence { _release: release })
     }
 
+    /// Records the size in bytes of every write batch that later commits write to the database.
+    /// Commits with nothing to write record nothing. Applies until set again, also across
+    /// [`Self::clear`] and [`Transaction::commit`].
+    pub fn set_write_batch_size_histogram(&mut self, histogram: &'a Histogram) {
+        self.write_batch_size_histogram = Some(histogram);
+    }
+
+    /// Stops recording write batch sizes until a histogram is set again, so that
+    /// commits that are not command batches stay out of the command batches'
+    /// histogram.
+    pub fn clear_write_batch_size_histogram(&mut self) {
+        self.write_batch_size_histogram = None;
+    }
+
+    /// Lets this transaction maintain the partition's position, starting from `position`, the
+    /// one at the partition's applied LSN. [`Self::advance_fsm_position`] advances it with every
+    /// record applied, and every later commit that writes something persists it while the
+    /// partition tracks byte offsets, so that each commit persists the position of the applied
+    /// LSN in that commit. It's kept across [`Self::clear`] and [`Transaction::commit`].
+    pub fn set_fsm_position(&mut self, position: FsmPosition) {
+        self.fsm_position = Some(position);
+    }
+
+    /// The partition's position, as of the records applied with this transaction so far. `None`
+    /// unless the transaction maintains it.
+    pub fn fsm_position(&self) -> Option<FsmPosition> {
+        self.fsm_position
+    }
+
+    /// Advances the partition's position, if this transaction maintains it, to the record or gap
+    /// that ends at `lsn`, of `bytes` as the log stores it.
+    pub fn advance_fsm_position(&mut self, lsn: Lsn, bytes: u64) {
+        if let Some(position) = &mut self.fsm_position {
+            position.advance(lsn, bytes);
+        }
+    }
+
+    /// Turns byte offsets on at the record at `lsn`, which they count from. The position is
+    /// written with this transaction's next commit, which also deletes the applied LSN persisted
+    /// on its own: from then on, only the position holds it. Fails if this transaction doesn't
+    /// maintain the partition's position (see [`Self::set_fsm_position`]).
+    pub fn start_byte_offsets(&mut self, lsn: Lsn) -> Result<()> {
+        let Some(position) = self.fsm_position.as_mut() else {
+            return Err(StorageError::Generic(anyhow!(
+                "can't turn byte offsets on: the transaction doesn't maintain the partition's \
+                 position"
+            )));
+        };
+        position.start_byte_offsets(lsn);
+        let position = *position;
+        delete_applied_lsn(self)?;
+        put_fsm_position(self, &position)
+    }
+
+    /// Has the next commit persist the partition's position even if it has nothing else to
+    /// write, for an applied LSN that only the position holds.
+    pub(crate) fn mark_fsm_position_pending(&mut self) {
+        self.fsm_position_pending = true;
+    }
+
     /// Clears up all buffered operations in the transaction buffer. A commit fence stays in
     /// place, since it belongs to whoever holds the [`CommitFence`].
     pub fn clear(&mut self) {
@@ -1020,16 +1295,6 @@ impl<'a> PartitionStoreTransaction<'a> {
             .clear();
         self.key_buffer.clear();
         self.value_buffer.clear();
-    }
-
-    fn read_options(&self) -> ReadOptions {
-        let mut opts = ReadOptions::default();
-
-        if let Some(snapshot) = self.snapshot.as_ref() {
-            opts.set_snapshot(snapshot);
-        }
-
-        opts
     }
 
     #[inline]
@@ -1076,11 +1341,6 @@ impl<'a> PartitionStoreTransaction<'a> {
             .single_delete_cf(self.data_cf_handle, key);
     }
 
-    pub(crate) fn cf_handle(&self, _table_kind: TableKind) -> &'a Arc<BoundColumnFamily<'a>> {
-        // Right now, everything is in one cf, return a reference and save CPU.
-        self.data_cf_handle
-    }
-
     pub(crate) fn cf_for_key_kind(&self, _key_kind: KeyKind) -> &'a Arc<BoundColumnFamily<'a>> {
         // Right now, everything is in one cf, return a reference and save CPU.
         self.data_cf_handle
@@ -1091,9 +1351,144 @@ impl<'a> PartitionStoreTransaction<'a> {
         self.meta.partition_id
     }
 
+    /// Puts the partition's `position` into the batch, with its partition store byte offset
+    /// advanced by the size of the batch, this put included. Returns the position it put.
+    fn put_fsm_position_counting_batch(
+        &mut self,
+        mut position: FsmPosition,
+    ) -> Result<FsmPosition> {
+        let batch_size = self.estimated_size_in_bytes();
+        // A position's encoded size only depends on which of its fixed-width fields are zero. Its
+        // store offset isn't once it counts the batch, unless it wraps to exactly zero: it then
+        // counts the 9 bytes that its omitted field doesn't take.
+        let encoded_len = bilrost::Message::encoded_len(&FsmPosition {
+            partition_store_byte_offset: u64::MAX,
+            ..position
+        });
+        let put_size = write_batch_put_size(
+            self.data_cf_handle.id(),
+            PartitionStateMachineKey::serialized_length_fixed(),
+            // StorageCodec's codec byte and the message
+            1 + encoded_len,
+        );
+        position.add_partition_store_bytes((batch_size + put_size) as u64);
+        put_fsm_position(self, &position)?;
+        // The size predicted above follows RocksDB's write batch format. Were it ever off, e.g.
+        // after a change of that format, the position just put would be off by the difference:
+        // carry on from the size actually added, so that the next commit is exact again.
+        let added = self.estimated_size_in_bytes() - batch_size;
+        if added != put_size {
+            debug_assert_eq!(
+                added, put_size,
+                "the position's put adds the size it predicts"
+            );
+            static LOGGED: Once = Once::new();
+            LOGGED.call_once(|| {
+                warn!(
+                    predicted = put_size,
+                    added,
+                    "The partition store byte offset counts a different size for the FSM \
+                     position's put than it adds to the write batch; offsets may be off by the \
+                     difference"
+                )
+            });
+            position.partition_store_byte_offset = position
+                .partition_store_byte_offset
+                .wrapping_add(added as u64)
+                .wrapping_sub(put_size as u64);
+        }
+        Ok(position)
+    }
+
     #[inline]
     pub(crate) fn storage_features(&self) -> StorageFeatures {
         self.storage_features
+    }
+
+    pub(crate) fn published_registry(&self) -> Arc<PublishedRegistry> {
+        Arc::clone(&self.published_registry)
+    }
+
+    /// Replaces the published registry, and with it the indexes maintained on
+    /// writes, once a commit changed it.
+    pub(crate) fn set_published_registry(&mut self, published_registry: Arc<PublishedRegistry>) {
+        self.published_registry = published_registry;
+    }
+
+    /// Whether a [`CommitFence`] currently holds back commits. Neither takes nor lifts a
+    /// fence; it only forgets one already released.
+    pub(crate) fn commits_held(&mut self) -> bool {
+        let held = self.commit_fence.as_mut().is_some_and(|released| {
+            matches!(
+                released.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            )
+        });
+        if !held {
+            self.commit_fence = None;
+        }
+        held
+    }
+
+    /// Marks the buffered writes, so that [`Self::rollback_to_save_point`] can drop
+    /// the ones that follow. Save points nest, and a commit or [`Self::clear`]
+    /// drops them.
+    pub(crate) fn set_save_point(&mut self) {
+        self.write_batch_with_index
+            .as_mut()
+            .expect("transaction valid")
+            .set_save_point();
+    }
+
+    /// Drops the writes buffered since the latest save point, and that save point.
+    pub(crate) fn rollback_to_save_point(&mut self) -> Result<()> {
+        self.write_batch_with_index
+            .as_mut()
+            .expect("transaction valid")
+            .rollback_to_save_point()
+            .map_err(|err| StorageError::Generic(err.into()))
+    }
+
+    /// Whether `key` exists, as an online migration looks it up
+    /// ([`crate::migrations::online`]), and the bytes of key and value read, for
+    /// [`Migrated::read_bytes`]. Reads through this transaction, so it sees the
+    /// writes staged here, and doesn't fill the block cache, so that background
+    /// work doesn't evict what commands read.
+    ///
+    /// ```ignore
+    /// let (exists, read_bytes) = tx.lookup_for_migration(JournalKey { .. })?;
+    /// ```
+    ///
+    /// [`Migrated::read_bytes`]: crate::migrations::online::Migrated::read_bytes
+    #[cfg_attr(not(test), expect(dead_code, reason = "ONLINE_MIGRATIONS is empty"))]
+    pub(crate) fn lookup_for_migration<K: EncodeTableKey>(
+        &mut self,
+        key: K,
+    ) -> Result<(bool, usize)> {
+        self.key_buffer.clear();
+        key.serialize_to(self.key_buffer);
+        let mut options = ReadOptions::default();
+        options.fill_cache(false);
+        let value = self
+            .write_batch_with_index
+            .as_ref()
+            .expect("transaction valid")
+            .get_pinned_from_batch_and_db_cf(
+                self.rocksdb.inner().as_raw_db(),
+                self.cf_for_key_kind(K::KEY_KIND),
+                &*self.key_buffer,
+                &options,
+            )
+            .map_err(|error| StorageError::Generic(error.into()))?;
+        let read = self.key_buffer.len() + value.as_ref().map_or(0, |value| value.len());
+        Ok((value.is_some(), read))
+    }
+
+    /// Whether no write is buffered.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.write_batch_with_index
+            .as_ref()
+            .is_none_or(|batch| batch.is_empty())
     }
 
     #[inline]
@@ -1102,7 +1497,27 @@ impl<'a> PartitionStoreTransaction<'a> {
     }
 }
 
-fn assert_partition_key_or_err(
+impl<'a> PartitionStoreTransaction<'a> {
+    /// Merges into the statistic keys of index `id`.
+    pub(crate) fn aggregated_stats<'b>(&'b mut self, id: u32) -> AggregatedStatsMut<'b, 'a> {
+        AggregatedStatsMut::new(self, id)
+    }
+}
+
+/// The bytes that a put adds to a RocksDB write batch, as RocksDB's write batch format lays it out:
+/// the record type, the column family's id unless it's the default one, then the key and the
+/// value, each after its length. The numbers are varint32s.
+fn write_batch_put_size(cf_id: u32, key_len: usize, value_len: usize) -> usize {
+    let varint32_len = |n: usize| (usize::BITS - n.leading_zeros()).div_ceil(7).max(1) as usize;
+    let cf_id_len = if cf_id == 0 {
+        0
+    } else {
+        varint32_len(cf_id as usize)
+    };
+    1 + cf_id_len + varint32_len(key_len) + key_len + varint32_len(value_len) + value_len
+}
+
+pub(crate) fn assert_partition_key_or_err(
     partition_key_range: KeyRange,
     partition_key: &impl WithPartitionKey,
 ) -> Result<()> {
@@ -1136,10 +1551,11 @@ impl Transaction for PartitionStoreTransaction<'_> {
             self.commit_fence = None;
         }
 
-        if self
-            .write_batch_with_index
-            .as_ref()
-            .is_none_or(|batch| batch.is_empty())
+        if !self.fsm_position_pending
+            && self
+                .write_batch_with_index
+                .as_ref()
+                .is_none_or(|batch| batch.is_empty())
         {
             return Ok(());
         }
@@ -1150,7 +1566,16 @@ impl Transaction for PartitionStoreTransaction<'_> {
             .admission
             .try_acquire()
             .ok_or(StorageError::OperationalError)?;
+        // The position this commit persists, kept once the write succeeded.
+        let position = self
+            .fsm_position
+            .filter(FsmPosition::has_byte_offsets)
+            .map(|position| self.put_fsm_position_counting_batch(position))
+            .transpose()?;
         let write_batch = self.write_batch_with_index.take().expect("nonempty batch");
+        if let Some(histogram) = self.write_batch_size_histogram {
+            histogram.record(write_batch.size_in_bytes() as f64);
+        }
 
         let io_mode = if Configuration::pinned()
             .worker
@@ -1164,20 +1589,26 @@ impl Transaction for PartitionStoreTransaction<'_> {
         let mut opts = rocksdb::WriteOptions::default();
         // We disable WAL since bifrost is our durable distributed log.
         opts.disable_wal(true);
+        let write = self.rocksdb.write_batch_with_index(
+            "partition-store-txn-commit",
+            Priority::High,
+            io_mode,
+            opts,
+            write_batch,
+            lease,
+        );
+        #[cfg(any(test, feature = "faults"))]
+        let write = crate::faults::queued(self.faults, write);
         self.write_batch_with_index = Some(
-            self.rocksdb
-                .write_batch_with_index(
-                    "partition-store-txn-commit",
-                    Priority::High,
-                    io_mode,
-                    opts,
-                    write_batch,
-                    lease,
-                )
+            write
                 .await
                 .map_err(|error| StorageError::Generic(error.into()))?,
         );
         self.write_batch_with_index.as_mut().unwrap().clear();
+        if position.is_some() {
+            self.fsm_position = position;
+        }
+        self.fsm_position_pending = false;
         Ok(())
     }
 
@@ -1189,42 +1620,72 @@ impl Transaction for PartitionStoreTransaction<'_> {
     }
 }
 
-impl StorageAccess for PartitionStoreTransaction<'_> {
-    type DBAccess<'b>
-        = DB
+impl PartitionStoreTransaction<'_> {
+    /// An iterator over this transaction's write batch on top of the database.
+    fn batch_iterator(
+        &self,
+        cf: &Arc<BoundColumnFamily<'_>>,
+        opts: ReadOptions,
+    ) -> DBRawIteratorWithThreadMode<'_, DB> {
+        let base = self
+            .rocksdb
+            .inner()
+            .as_raw_db()
+            .raw_iterator_cf_opt(cf, opts);
+        self.write_batch_with_index
+            .as_ref()
+            .expect("transaction valid")
+            .iterator_with_base_cf(base, cf)
+    }
+}
+
+impl StorageRead for PartitionStoreTransaction<'_> {
+    type Iterator<'b>
+        = DBRawIteratorWithThreadMode<'b, DB>
     where
         Self: 'b;
 
     fn iterator_from<K: EncodeTableKeyPrefix>(
         &self,
         scan: TableScan<K>,
-    ) -> Result<DBRawIteratorWithThreadMode<'_, Self::DBAccess<'_>>> {
+    ) -> Result<Self::Iterator<'_>> {
         let scan: PhysicalScan<Bytes> = scan.into();
         let (cf, start, opts) = match scan {
             PhysicalScan::Prefix(key_kind, prefix) => {
-                let mut opts = self.read_options();
+                let mut opts = ReadOptions::default();
                 configure_prefix_iterator_opts(&mut opts, prefix.as_ref());
                 (self.cf_for_key_kind(key_kind), prefix, opts)
             }
             PhysicalScan::RangeExclusive(key_kind, scan_mode, start, end) => {
-                let mut opts = self.read_options();
+                let mut opts = ReadOptions::default();
                 configure_range_iterator_opts(&mut opts, scan_mode, start.as_ref(), end);
                 (self.cf_for_key_kind(key_kind), start, opts)
             }
         };
 
-        let base = self
-            .rocksdb
-            .inner()
-            .as_raw_db()
-            .raw_iterator_cf_opt(cf, opts);
-        let mut iterator = self
-            .write_batch_with_index
-            .as_ref()
-            .expect("transaction valid")
-            .iterator_with_base_cf(base, cf);
+        let mut iterator = self.batch_iterator(cf, opts);
         iterator.seek(start);
         Ok(iterator)
+    }
+
+    #[inline]
+    fn get<K: AsRef<[u8]>>(
+        &self,
+        key_kind: KeyKind,
+        key: K,
+    ) -> Result<Option<DBPinnableSlice<'_>>> {
+        let cf = self.cf_for_key_kind(key_kind);
+        let read_options = ReadOptions::default();
+        self.write_batch_with_index
+            .as_ref()
+            .expect("transaction valid")
+            .get_pinned_from_batch_and_db_cf(
+                self.rocksdb.inner().as_raw_db(),
+                cf,
+                key,
+                &read_options,
+            )
+            .map_err(|error| StorageError::Generic(error.into()))
     }
 
     #[inline]
@@ -1233,35 +1694,14 @@ impl StorageAccess for PartitionStoreTransaction<'_> {
         self.key_buffer.reserve(min_size);
         self.key_buffer
     }
+}
 
+impl StorageAccess for PartitionStoreTransaction<'_> {
     #[inline]
     fn cleared_value_buffer_mut(&mut self, min_size: usize) -> &mut BytesMut {
         self.value_buffer.clear();
         self.value_buffer.reserve(min_size);
         self.value_buffer
-    }
-
-    #[inline]
-    fn get<K: AsRef<[u8]>>(&self, table: TableKind, key: K) -> Result<Option<DBPinnableSlice<'_>>> {
-        let table = self.cf_handle(table);
-        self.write_batch_with_index
-            .as_ref()
-            .expect("transaction valid")
-            .get_pinned_from_batch_and_db_cf(
-                self.rocksdb.inner().as_raw_db(),
-                table,
-                key,
-                &self.read_options(),
-            )
-            .map_err(|error| StorageError::Generic(error.into()))
-    }
-
-    fn get_durable<K: AsRef<[u8]>>(
-        &self,
-        _table: TableKind,
-        _key: K,
-    ) -> Result<Option<DBPinnableSlice<'_>>> {
-        unreachable!("ReadTier::Persisted is not meant to be used in WBI");
     }
 
     #[inline]
@@ -1288,31 +1728,8 @@ impl StorageAccess for PartitionStoreTransaction<'_> {
     }
 }
 
-pub(crate) trait StorageAccess {
-    type DBAccess<'a>: rocksdb::DBAccess
-    where
-        Self: 'a;
-
-    fn iterator_from<K: EncodeTableKeyPrefix>(
-        &self,
-        scan: TableScan<K>,
-    ) -> Result<DBRawIteratorWithThreadMode<'_, Self::DBAccess<'_>>>;
-
-    fn cleared_key_buffer_mut(&mut self, min_size: usize) -> &mut BytesMut;
-
+pub(crate) trait StorageAccess: StorageRead {
     fn cleared_value_buffer_mut(&mut self, min_size: usize) -> &mut BytesMut;
-
-    fn get<K: AsRef<[u8]>>(&self, table: TableKind, key: K) -> Result<Option<DBPinnableSlice<'_>>>;
-
-    /// Forces a read from persistent storage, bypassing memtables and block cache.
-    ///
-    /// This means that that you might not get the latest value, but the value that was persisted
-    /// (flushed) at the time of the call.
-    fn get_durable<K: AsRef<[u8]>>(
-        &self,
-        table: TableKind,
-        key: K,
-    ) -> Result<Option<DBPinnableSlice<'_>>>;
 
     fn put_cf(
         &mut self,
@@ -1381,6 +1798,119 @@ pub(crate) trait StorageAccess {
 
         self.delete_cf(K::TABLE, buffer)
     }
+}
+
+/// A cursor over the entries of a scan, implemented for both RocksDB's raw iterators and
+/// snapshot scans.
+pub(crate) trait StorageIterator {
+    /// The key and value at the current position. Returns `Ok(None)` once the iterator has moved
+    /// past the last entry, or the error that stopped it.
+    #[allow(clippy::type_complexity)]
+    fn item(&self) -> Result<Option<(&[u8], &[u8])>>;
+
+    /// Moves to the next entry.
+    fn next(&mut self);
+}
+
+impl<D: rocksdb::DBAccess> StorageIterator for DBRawIteratorWithThreadMode<'_, D> {
+    #[inline]
+    fn item(&self) -> Result<Option<(&[u8], &[u8])>> {
+        match DBRawIteratorWithThreadMode::item(self) {
+            Some(entry) => Ok(Some(entry)),
+            None => self
+                .status()
+                .map(|()| None)
+                .map_err(|err| StorageError::Generic(err.into())),
+        }
+    }
+
+    #[inline]
+    fn next(&mut self) {
+        DBRawIteratorWithThreadMode::next(self)
+    }
+}
+
+impl<H> StorageIterator for ReadIterator<'_, H> {
+    #[inline]
+    fn item(&self) -> Result<Option<(&[u8], &[u8])>> {
+        ReadIterator::item(self).map_err(|err| StorageError::Generic(err.into()))
+    }
+
+    #[inline]
+    fn next(&mut self) {
+        ReadIterator::next(self)
+    }
+}
+
+/// Reads of a partition's tables: point lookups and scans.
+pub(crate) trait StorageRead {
+    type Iterator<'a>: StorageIterator + Send
+    where
+        Self: 'a;
+
+    fn iterator_from<K: EncodeTableKeyPrefix>(
+        &self,
+        scan: TableScan<K>,
+    ) -> Result<Self::Iterator<'_>>;
+
+    #[inline]
+    fn get_first_blocking<K, F, R>(&mut self, scan: TableScan<K>, f: F) -> Result<R>
+    where
+        K: EncodeTableKeyPrefix,
+        F: FnOnce(Option<(&[u8], &[u8])>) -> Result<R>,
+    {
+        let iterator = self.iterator_from(scan)?;
+        f(iterator.item()?)
+    }
+
+    #[inline]
+    fn for_each_key_value_in_place<K, F, R>(
+        &self,
+        scan: TableScan<K>,
+        mut op: F,
+    ) -> Result<Vec<Result<R>>>
+    where
+        K: EncodeTableKeyPrefix,
+        F: FnMut(&[u8], &[u8]) -> TableScanIterationDecision<R>,
+    {
+        let mut res = Vec::new(); // TODO: this should be passed in.
+
+        let mut iterator = self.iterator_from(scan)?;
+
+        loop {
+            let (k, v) = match iterator.item() {
+                Ok(Some(item)) => item,
+                Ok(None) => return Ok(res),
+                Err(err) => {
+                    // We stopped the iteration because of an iterator error
+                    res.push(Err(err));
+                    return Ok(res);
+                }
+            };
+            match op(k, v) {
+                TableScanIterationDecision::Emit(result) => {
+                    res.push(result);
+                    iterator.next();
+                }
+                TableScanIterationDecision::BreakWith(result) => {
+                    res.push(result);
+                    return Ok(res);
+                }
+                TableScanIterationDecision::Continue => {
+                    iterator.next();
+                }
+                TableScanIterationDecision::Break => {
+                    return Ok(res);
+                }
+            };
+        }
+    }
+
+    /// Reads the value of `key`, whose kind is `key_kind`, without copying it.
+    fn get<K: AsRef<[u8]>>(&self, key_kind: KeyKind, key: K)
+    -> Result<Option<DBPinnableSlice<'_>>>;
+
+    fn cleared_key_buffer_mut(&mut self, min_size: usize) -> &mut BytesMut;
 
     #[inline]
     fn get_value_proto<K, V>(&mut self, key: K) -> Result<Option<V>>
@@ -1409,58 +1939,13 @@ pub(crate) trait StorageAccess {
         key.serialize_to(&mut buf);
         let buf = buf.split();
 
-        self.get(K::TABLE, &buf)?
+        self.get(K::KEY_KIND, &buf)?
             .map(|value| {
                 let mut slice = value.as_ref();
                 StorageCodec::decode(&mut slice)
             })
             .transpose()
             .map_err(|err| StorageError::Generic(err.into()))
-    }
-
-    /// Forces a read from persistent storage, bypassing memtables and block cache.
-    /// This means that that you might not get the latest value, but the value that was
-    /// persisted (flushed) at the time of the call.
-    #[inline]
-    fn get_durable_value<K, V>(&mut self, key: K) -> Result<Option<V>>
-    where
-        K: EncodeTableKey,
-        V: PartitionStoreProtobufValue,
-        <<V as PartitionStoreProtobufValue>::ProtobufType as TryInto<V>>::Error:
-            Into<anyhow::Error>,
-    {
-        let mut buf = self.cleared_key_buffer_mut(key.serialized_length());
-        key.serialize_to(&mut buf);
-        let buf = buf.split();
-
-        match self.get_durable(K::TABLE, &buf) {
-            Ok(value) => {
-                let slice = value.as_ref().map(|v| v.as_ref());
-
-                if let Some(mut slice) = slice {
-                    Ok(Some(V::decode(&mut slice)?))
-                } else {
-                    Ok(None)
-                }
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    #[inline]
-    fn get_first_blocking<K, F, R>(&mut self, scan: TableScan<K>, f: F) -> Result<R>
-    where
-        K: EncodeTableKeyPrefix,
-        F: FnOnce(Option<(&[u8], &[u8])>) -> Result<R>,
-    {
-        let iterator = self.iterator_from(scan)?;
-        let item = iterator.item();
-        if item.is_none() {
-            iterator
-                .status()
-                .map_err(|err| StorageError::Generic(err.into()))?;
-        }
-        f(item)
     }
 
     #[inline]
@@ -1473,55 +1958,13 @@ pub(crate) trait StorageAccess {
         key.serialize_to(&mut buf);
         let buf = buf.split();
 
-        match self.get(K::TABLE, &buf) {
+        match self.get(K::KEY_KIND, &buf) {
             Ok(value) => {
                 let slice = value.as_ref().map(|v| v.as_ref());
                 f(&buf, slice)
             }
             Err(err) => Err(err),
         }
-    }
-
-    #[inline]
-    fn for_each_key_value_in_place<K, F, R>(
-        &self,
-        scan: TableScan<K>,
-        mut op: F,
-    ) -> Result<Vec<Result<R>>>
-    where
-        K: EncodeTableKeyPrefix,
-        F: FnMut(&[u8], &[u8]) -> TableScanIterationDecision<R>,
-    {
-        let mut res = Vec::new(); // TODO: this should be passed in.
-
-        let mut iterator = self.iterator_from(scan)?;
-
-        while let Some((k, v)) = iterator.item() {
-            match op(k, v) {
-                TableScanIterationDecision::Emit(result) => {
-                    res.push(result);
-                    iterator.next();
-                }
-                TableScanIterationDecision::BreakWith(result) => {
-                    res.push(result);
-                    return Ok(res);
-                }
-                TableScanIterationDecision::Continue => {
-                    iterator.next();
-                    continue;
-                }
-                TableScanIterationDecision::Break => {
-                    return Ok(res);
-                }
-            };
-        }
-
-        // Check whether we stopped the iteration because of an iterator error
-        if let Some(err) = iterator.status().err() {
-            res.push(Err(StorageError::Generic(err.into())));
-        }
-
-        Ok(res)
     }
 }
 
@@ -1530,14 +1973,14 @@ mod tests {
     use bytes::{Buf, BufMut};
 
     use restate_rocksdb::RocksDbManager;
-    use restate_storage_api::{IsolationLevel, StorageError, Transaction};
+    use restate_storage_api::{StorageError, Transaction};
     use restate_types::identifiers::{PartitionId, PartitionKey};
     use restate_types::logs::Lsn;
     use restate_types::partitions::Partition;
     use restate_types::sharding::KeyRange;
 
     use crate::keys::{DecodeTableKey, EncodeTableKey, KeyKind};
-    use crate::partition_store::StorageAccess;
+    use crate::partition_store::{StorageAccess, StorageRead};
     use crate::{PartitionSeal, PartitionStoreManager, TableKind};
 
     impl EncodeTableKey for String {
@@ -1577,7 +2020,11 @@ mod tests {
         // Retired/reserved kinds intentionally map to no table: their byte
         // encodings are kept reserved but nothing reads or writes them.
         #[allow(deprecated)]
-        let reserved = [KeyKind::Idempotency, KeyKind::InvocationStatusV1];
+        let reserved = [
+            KeyKind::Idempotency,
+            KeyKind::InvocationStatusV1,
+            KeyKind::LegacyStats,
+        ];
 
         for kind in KeyKind::VARIANTS {
             if reserved.contains(kind) {
@@ -1613,19 +2060,18 @@ mod tests {
         partition_store.put_kv_raw(key_b.clone(), 0_u32.to_be_bytes())?;
 
         let mut partition_store_clone = partition_store.clone();
-        // repeatable reads shouldn't see writes of concurrently finishing transactions
-        let mut read_txn =
-            partition_store.transaction_with_isolation(IsolationLevel::RepeatableReads);
+        // a snapshot shouldn't see writes of concurrently finishing transactions
+        let mut read_snapshot = partition_store.snapshot()?;
 
-        let value_a = read_txn.get_kv_raw(key_a.clone(), decode_u32)?;
+        let value_a = read_snapshot.get_kv_raw(key_a.clone(), decode_u32)?;
 
-        // concurrent write which should not be visible by read_txn
+        // concurrent write which should not be visible by read_snapshot
         let mut write_txn = partition_store_clone.transaction();
         write_txn.put_kv_raw(key_a.clone(), 42_u32.to_be_bytes())?;
         write_txn.put_kv_raw(key_b.clone(), 42_u32.to_be_bytes())?;
         write_txn.commit().await?;
 
-        let value_b = read_txn.get_kv_raw(key_b.clone(), decode_u32)?;
+        let value_b = read_snapshot.get_kv_raw(key_b.clone(), decode_u32)?;
 
         assert_eq!(value_a, value_b);
 

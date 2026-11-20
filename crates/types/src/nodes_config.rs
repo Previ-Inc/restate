@@ -176,6 +176,25 @@ pub enum ClusterFeature {
     /// time and cannot be toggled afterward.
     #[cfg_attr(feature = "clap", clap(skip))]
     ControlledIdempotentSharding,
+    /// Spaces the partition-key buckets of each unscoped service evenly over the
+    /// partition-key space instead of hashing every bucket independently.
+    ///
+    /// Each unscoped service owns a fixed set of partition-key buckets, used for idempotent
+    /// invocations under [`ClusterFeature::ControlledIdempotentSharding`] and for the
+    /// ingestion API. (All other non-idempotent invocations always use evenly spaced buckets, since
+    /// nothing depends on which partition they land on.) When disabled, every bucket is hashed to an
+    /// independent partition key, which leaves some partitions with noticeably more buckets
+    /// than others. When enabled, the buckets are evenly spaced, so every partition of an
+    /// equally sized partition table owns the same number of buckets (+/- 1).
+    ///
+    /// Like [`ClusterFeature::ControlledIdempotentSharding`], this is a one-way, cluster-wide
+    /// decision fixed at provisioning time: switching would re-shard idempotent invocations
+    /// onto different partitions and break deduplication.
+    ///
+    /// Not part of [`ClusterFeature::default_features`] yet: it is only enabled when the
+    /// provisioning node sets `experimental-enable-evenly-spaced-service-buckets`.
+    #[cfg_attr(feature = "clap", clap(skip))]
+    EvenlySpacedServiceBuckets,
 }
 
 impl ClusterFeature {
@@ -640,6 +659,34 @@ impl NodesConfiguration {
         })
     }
 
+    /// Whether every worker that may run partitions, that is every one that isn't disabled, last
+    /// started with `version` or a newer release, or a pre-release of either. Workers record their
+    /// version each time they start; one that hasn't recorded it counts as older.
+    pub fn all_workers_run_at_least(&self, version: &SemanticRestateVersion) -> bool {
+        self.workers_run_at_least(version, false)
+    }
+
+    /// Like [`Self::all_workers_run_at_least`], but disabled workers count too: a partition's
+    /// current replica set may still consist of disabled workers until it's reconfigured, so
+    /// whatever reads partition data must assume they serve it.
+    pub fn all_workers_including_disabled_run_at_least(
+        &self,
+        version: &SemanticRestateVersion,
+    ) -> bool {
+        self.workers_run_at_least(version, true)
+    }
+
+    fn workers_run_at_least(&self, version: &SemanticRestateVersion, disabled: bool) -> bool {
+        self.iter_role(Role::Worker)
+            .filter(|(_, node)| disabled || !node.worker_config.worker_state.is_disabled())
+            .all(|(_, node)| {
+                node.binary_version
+                    .as_ref()
+                    .and_then(|binary| SemanticRestateVersion::try_from(binary).ok())
+                    .is_some_and(|binary| binary.release_is_equal_or_newer_than(version))
+            })
+    }
+
     /// Removes the fabric and control address lists from every node.
     pub fn clear_address_lists(&mut self) {
         for (_, node) in self.iter_mut() {
@@ -1003,25 +1050,27 @@ mod tests {
         assert!(matches!(removed, Err(NodesConfigError::Deleted(_))));
     }
 
+    /// A configuration of nodes N1, N2, ... with one role each, which last started with the given
+    /// binary version, or recorded none.
+    fn config_with(nodes: &[(Role, Option<&str>)]) -> NodesConfiguration {
+        let mut config = NodesConfiguration::new_for_testing();
+        for (id, (role, version)) in (1u32..).zip(nodes) {
+            let mut node = NodeConfig::builder()
+                .name(format!("node-{id}"))
+                .current_generation(GenerationalNodeId::new(id, 1))
+                .address("unix:/run/f.sock".parse().unwrap())
+                .roles(EnumSet::only(*role))
+                .binary_version(RestateVersion::current())
+                .build();
+            node.binary_version = version.map(|version| RestateVersion::new(version.into()));
+            config.upsert_node(with_address_lists(node));
+        }
+        config
+    }
+
     #[test]
     fn membership_writes_keep_address_lists_only_when_all_metadata_servers_do() {
         use Role::{MetadataServer as Meta, Worker};
-
-        let config_with = |nodes: &[(Role, Option<&str>)]| {
-            let mut config = NodesConfiguration::new_for_testing();
-            for (id, (role, version)) in (1u32..).zip(nodes) {
-                let mut node = NodeConfig::builder()
-                    .name(format!("node-{id}"))
-                    .current_generation(GenerationalNodeId::new(id, 1))
-                    .address("unix:/run/f.sock".parse().unwrap())
-                    .roles(EnumSet::only(*role))
-                    .binary_version(RestateVersion::current())
-                    .build();
-                node.binary_version = version.map(|version| RestateVersion::new(version.into()));
-                config.upsert_node(with_address_lists(node));
-            }
-            config
-        };
 
         for (nodes, keep) in [
             (vec![(Meta, Some("1.9.0")), (Meta, Some("1.10.2"))], true),
@@ -1058,6 +1107,49 @@ mod tests {
             ..before
         };
         assert_eq!(config.find_node_by_name("node-1"), Some(&expected));
+    }
+
+    #[test]
+    fn all_workers_run_at_least_counts_workers_that_may_run_partitions() {
+        use Role::{MetadataServer as Meta, Worker};
+        let v1_9_0 = SemanticRestateVersion::new(1, 9, 0);
+
+        for (nodes, all) in [
+            (
+                vec![(Worker, Some("1.9.0")), (Worker, Some("1.10.2"))],
+                true,
+            ),
+            // Pre-releases of 1.9.0 count.
+            (
+                vec![(Worker, Some("1.9.0-dev")), (Worker, Some("1.9.0-rc.1"))],
+                true,
+            ),
+            // Only workers count.
+            (vec![(Worker, Some("1.9.0")), (Meta, Some("1.8.1"))], true),
+            (
+                vec![(Worker, Some("1.9.0")), (Worker, Some("1.8.2"))],
+                false,
+            ),
+            (vec![(Worker, Some("1.9.0")), (Worker, None)], false),
+        ] {
+            let config = config_with(&nodes);
+            assert_eq!(config.all_workers_run_at_least(&v1_9_0), all, "{nodes:?}");
+        }
+
+        // Neither a disabled nor a removed worker counts.
+        let mut config = config_with(&[
+            (Worker, Some("1.9.0")),
+            (Worker, Some("1.8.2")),
+            (Worker, Some("1.8.1")),
+        ]);
+        let mut disabled = config
+            .find_node_by_id(NodeId::new_plain(2))
+            .unwrap()
+            .clone();
+        disabled.worker_config.worker_state = WorkerState::Disabled;
+        config.upsert_node(disabled);
+        config.remove_node_unchecked(PlainNodeId::new(3));
+        assert!(config.all_workers_run_at_least(&v1_9_0));
     }
 
     #[test]

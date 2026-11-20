@@ -8,6 +8,16 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+//! Inbox storage with a legacy, non-mem-comparable service identity.
+//!
+//! [`InboxKey`] is **not ordered across all logical fields**: `service_name` and
+//! `service_key` are length-prefixed. Its partition-key prefix is ordered, and
+//! `sequence_number` is ordered within a fixed service identity. Those local
+//! guarantees do not make the complete key mem-comparable.
+//! See the [key encoding families](crate::keys#two-encoding-families).
+
+mod scan;
+
 use std::ops::ControlFlow;
 
 use bytestring::ByteString;
@@ -31,6 +41,8 @@ use crate::{
     TableScanIterationDecision, break_on_err,
 };
 
+pub use scan::InboxTable;
+
 define_table_key!(
     Inbox,
     KeyKind::Inbox,
@@ -38,7 +50,7 @@ define_table_key!(
         partition_key: PartitionKey,
         service_name: ByteString,
         service_key: ByteString,
-        sequence_number: u64
+        sequence_number: u64,
     )
 );
 

@@ -625,6 +625,14 @@ pub struct CommonOptions {
     /// have the same.
     cluster_name: String,
 
+    /// Reject requests on ingress and admin listeners whose target cluster does not match our own name
+    /// with a 421 Misdirected Request.
+    ///
+    /// Since v1.8.2
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    pub reject_misdirected_requests: bool,
+
     /// # Auto cluster provisioning
     ///
     /// If true, then this node is allowed to automatically provision as a new cluster.
@@ -884,7 +892,8 @@ pub struct CommonOptions {
     /// # Disable the config table
     ///
     /// Disables the `config` SQL table, which exposes the node's running
-    /// configuration via SQL queries.
+    /// configuration via SQL queries. Evaluated when a query session is created;
+    /// existing sessions retain their original table visibility.
     ///
     /// Since v1.7.1
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1026,6 +1035,46 @@ macro_rules! experimental {
 // `is_<name>_enabled()` / `set_<name>()` accessors, and the entry exposed (under the bare
 // name, without the `experimental_enable_` prefix) by the admin `/version` API.
 experimental! {
+    /// # Query engine V2
+    ///
+    /// Runs the experimental distributed query engine (V2) next to the default
+    /// one (V1): starts the query task service, and lets admin `/query` requests
+    /// select V2 with the header `X-Restate-Query-Engine: v2`. Off by default.
+    /// Enable it on every node that coordinates or serves queries, once all nodes
+    /// run v1.8.2 or newer, and restart them.
+    ///
+    /// V2 serves most but not all of V1's tables; query the others with
+    /// `X-Restate-Query-Engine: v1`. V2 doesn't bound the bytes of a batch yet: a
+    /// query over large rows, such as big journal entries or state values, can
+    /// fail when a batch exceeds `networking.message-size-limit`.
+    ///
+    /// Since v1.8.2
+    query_engine_v2,
+
+    /// # Default to query engine V2
+    ///
+    /// Uses V2 for queries that don't select an engine: admin `/query` requests
+    /// without an `X-Restate-Query-Engine` header, which includes the `restate`
+    /// CLI's commands, and the queries `restatectl` sends to the cluster
+    /// controller, from `restatectl sql` without `--engine` and from its preview
+    /// `status`, `partitions list` and `logs list`. An explicit `v1` or `v2`
+    /// still wins. Also enables V2 on the node, as
+    /// `experimental-enable-query-engine-v2` does. Read when the node starts;
+    /// restart to change it.
+    ///
+    /// Since v1.8.2
+    query_engine_v2_default,
+
+    /// # Operator-level query tables
+    ///
+    /// Lets admin `/query` requests with the header `X-Restate-Query-Level:
+    /// operator` query the cluster tables, except `config`. Off by default; while
+    /// off, the header is ignored. Applies to both query engines. Read when the
+    /// admin service starts; restart to change it.
+    ///
+    /// Since v1.8.2
+    query_operator_tables,
+
     /// # AWS-to-GCP workload identity federation
     ///
     /// Allows registering deployments that authenticate through a Google workload identity
@@ -1146,6 +1195,39 @@ experimental! {
     /// Since v1.8.1
     preflight_signal_recording,
 
+    /// # Track the byte offsets of partitions
+    ///
+    /// When enabled, partitions track how far they have applied their log and written their
+    /// partition store in bytes, next to their applied LSN. A partition turns them on when it
+    /// next elects a leader with this option enabled. Leaders running v1.9.0 or newer turn them
+    /// on regardless of this option, once every worker node in the cluster runs v1.9.0 or newer.
+    ///
+    /// Only enable once all nodes run v1.8.2 or newer. Once a partition has enabled it, it stays
+    /// enabled even if this option is removed.
+    ///
+    /// Once enabled, you **cannot** roll back to a Restate-server version older than v1.8.2.
+    ///
+    /// Since v1.8.2
+    byte_offsets,
+
+    /// # Evenly spaced partition-key buckets for unscoped services
+    ///
+    /// When enabled while the cluster is provisioned, idempotent invocations of unscoped
+    /// services and ingestion API invocations are spread evenly across partitions. The setting only
+    /// takes effect at provisioning time: enabling or disabling it on an already provisioned
+    /// cluster has no effect.
+    ///
+    /// A cluster provisioned with this option **cannot** be rolled back to a Restate-server
+    /// version older than v1.8.2.
+    ///
+    /// This will be the default for newly provisioned clusters from v1.9.0.
+    ///
+    /// TODO(v1.9): Add `ClusterFeature::EvenlySpacedServiceBuckets` to
+    /// `ClusterFeature::default_features()` and remove this option.
+    ///
+    /// Since v1.8.2
+    evenly_spaced_service_buckets,
+
     /// # Remove orphaned active VQueue markers on startup
     ///
     /// Escape hatch for partitions that fail to start because an active vqueue has no
@@ -1158,6 +1240,113 @@ experimental! {
     /// Since v1.8.2
     vqueue_orphaned_active_marker_removal,
 
+    /// # Status Gauges For VQueue Entries
+    ///
+    /// Maintains current stage/status counts for VQueue entries by service,
+    /// deployment, and virtual object. Counts include invocations and state
+    /// mutations, retaining completed entries until deletion. Each partition
+    /// counts the entries written from then on and backfills the entries that
+    /// existed before in the background; until that backfill completes, queries
+    /// of the statistics tables fail on that partition.
+    ///
+    /// Maintenance persists across restarts even if this flag is removed, unless
+    /// status gauges are explicitly reset. Statistics-table visibility is controlled
+    /// separately on the query coordinator.
+    ///
+    /// Enabling this option registers the statistics in the partition's registry
+    /// and raises the partition's minimum Restate version to v1.8.2.
+    /// That stays, also after the option is removed or the gauges are reset: a
+    /// node that has ever run with it cannot be rolled back to an older version.
+    ///
+    /// Since v1.8.2
+    track_status_gauges,
+
+    /// # Statistics query tables
+    ///
+    /// Shows the `sys_service_stats`, `sys_deployment_stats` and
+    /// `sys_virtual_object_stats` tables in SQL queries, in both query engines
+    /// (V1 and V2). Off by default. Only new query sessions see a change;
+    /// sessions already open keep the tables they started with.
+    ///
+    /// To build these statistics, first enable
+    /// `experimental-enable-track-status-gauges` on workers, and wait until the
+    /// statistics are complete on every partition (status `complete` in
+    /// `restate.cluster.registry`); this option doesn't start that or wait for
+    /// it. A query fails if a partition it reads has missing or incomplete
+    /// statistics, instead of returning a partial total. Enable this only once
+    /// all nodes are upgraded: an older node can't serve the tables.
+    ///
+    /// Since v1.8.2
+    query_stats_tables,
+
+    /// # Reset status gauges
+    ///
+    /// Deletes the local service, deployment, and virtual-object status gauges and
+    /// stops maintaining them when each partition starts. While enabled, this takes
+    /// precedence over the other status-gauge options, and statistics queries fail
+    /// on the partition. Statistics-table visibility is controlled independently
+    /// on the query coordinator.
+    ///
+    /// To rebuild the counts from retained VQueue entries, turn this option off,
+    /// turn `experimental-enable-track-status-gauges` on, and restart the nodes:
+    /// the gauges are registered again and backfilled in the background.
+    /// Invocation and VQueue entry data are preserved during reset. A reset does
+    /// not lift the partition's minimum Restate version of v1.8.2 that enabling
+    /// the gauges set.
+    ///
+    /// Since v1.8.2
+    status_gauges_reset,
+
+    /// # Entry indexes
+    ///
+    /// Maintains secondary indexes over VQueue entries, such as entries by service
+    /// and handler, newest created first. Each partition indexes the entries
+    /// written from then on and backfills the entries that existed before in the
+    /// background. Queries don't read these indexes yet.
+    ///
+    /// Maintenance persists across restarts even if this flag is removed, unless
+    /// the entry indexes are explicitly reset.
+    ///
+    /// Enabling this option registers the indexes in the partition's registry and
+    /// raises the partition's minimum Restate version to v1.8.2.
+    /// That stays, also after the option is removed or the indexes are reset: a
+    /// node that has ever run with it cannot be rolled back to an older version.
+    ///
+    /// Since v1.8.2
+    track_entry_indexes,
+
+    /// # Reset entry indexes
+    ///
+    /// Deletes the local entry indexes and stops maintaining them when each
+    /// partition starts. While enabled, this takes precedence over
+    /// `experimental-enable-track-entry-indexes`, and queries read as they do
+    /// without the indexes.
+    ///
+    /// To rebuild them, turn this option off, turn
+    /// `experimental-enable-track-entry-indexes` on, and restart the nodes: the
+    /// indexes are registered again and backfilled in the background. VQueue entry
+    /// data is preserved. A reset does not lift the partition's minimum Restate
+    /// version of v1.8.2 that enabling the indexes set.
+    ///
+    /// Since v1.8.2
+    entry_indexes_reset,
+
+    /// # Index query tables in V2
+    ///
+    /// Shows the index tables, such as the entry-by-queue index, in query sessions
+    /// of the V2 engine, for inspecting them with SQL. Off by default; evaluated for
+    /// each new session on the query coordinator. Tables of indexes whose
+    /// definitions aren't available yet, such as the entry-by-service index, stay
+    /// hidden.
+    ///
+    /// This option only controls what SQL can see. V2 reads a table through a
+    /// complete index whenever a query restricts the indexed columns, with or
+    /// without it: for example `sys_vqueues` and `sys_vqueue_entry_status` through
+    /// the scheduler's queue stages when filtering by queue or by stage.
+    ///
+    /// Since v1.8.2
+    query_index_tables,
+
     /// # Enables service protocol v8
     ///
     /// Set to `true` to enable the experimental service protocol v8,
@@ -1168,6 +1357,28 @@ experimental! {
     ///
     /// Since v1.8.2
     protocol_v8,
+
+    /// # Write large journal entries into the blob table
+    ///
+    /// Journal entries larger than `worker.inline-journal-entry-threshold` are stored in the
+    /// blob table instead of the journal.
+    ///
+    /// It only affects local storage, so nodes can enable it independently. However, partition
+    /// snapshots taken where it's enabled can only be restored by v1.8.2 or newer, so only enable
+    /// it once all nodes run v1.8.2 or newer. Once a partition store has enabled it, it stays
+    /// enabled even if this option is turned off, including on stores restored from its
+    /// snapshots, and you **cannot** roll back to a Restate-server version older than v1.8.2.
+    ///
+    /// Since v1.8.2
+    write_blob_table,
+}
+
+impl Experimental {
+    /// Whether this node runs query engine V2: enabled directly, or by making it
+    /// the default for admin queries, which implies it.
+    pub fn is_query_engine_v2_running(&self) -> bool {
+        self.is_query_engine_v2_enabled() || self.is_query_engine_v2_default_enabled()
+    }
 }
 
 serde_with::with_prefix!(pub prefix_tokio_console "tokio_console_");
@@ -1418,6 +1629,7 @@ impl Default for CommonOptions {
             location: None,
             force_node_id: None,
             cluster_name: "localcluster".to_owned(),
+            reject_misdirected_requests: false,
             // auto provision the cluster by default. This is very likely to change in the future to be
             // false by default. For now, this is true to make the converged deployment backward
             // compatible and easy for users.

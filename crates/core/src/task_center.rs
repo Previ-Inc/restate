@@ -39,7 +39,7 @@ use tokio::task::LocalSet;
 use tokio::task_local;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{Instrument, debug, error, info, trace, warn};
 
 #[cfg(debug_assertions)]
 use crate::metric_definitions::{STATUS_COMPLETED, STATUS_FAILED, TC_FINISHED, TC_SPAWN};
@@ -151,6 +151,13 @@ impl TaskCenter {
                 .expect("test finalization has already started")
                 .push(finalizer);
         });
+    }
+
+    /// Exits the process if a requested shutdown has not completed within twice the shutdown
+    /// grace period. The watchdog runs on its own OS thread, so it fires even if the async
+    /// runtimes are stuck. Only enable this in binaries that own the process.
+    pub fn enable_shutdown_watchdog() {
+        Self::with_current(|tc| tc.enable_shutdown_watchdog())
     }
 
     /// Returns true if the task center was requested to shutdown
@@ -366,6 +373,8 @@ struct TaskCenterInner {
     on_shutdown: Mutex<Option<BoxFuture<'static, ()>>>,
     // None closes registration once test finalization starts.
     test_finalizers: Mutex<Option<Vec<BoxFuture<'static, ()>>>>,
+    /// If set, the process exits if a shutdown takes longer than twice the grace period.
+    shutdown_watchdog_enabled: AtomicBool,
 }
 
 impl TaskCenterInner {
@@ -405,6 +414,7 @@ impl TaskCenterInner {
             health: Health::default(),
             on_shutdown: Mutex::default(),
             test_finalizers: Mutex::new(Some(Vec::new())),
+            shutdown_watchdog_enabled: AtomicBool::new(false),
         }
     }
 
@@ -1080,25 +1090,43 @@ impl TaskCenterInner {
             return;
         }
 
-        let start = Instant::now();
-        let shutdown = self.shutdown_node_inner(reason, exit_code);
-        let shutdown_result = if let Some(grace_period) = grace_period {
-            tokio::time::timeout(grace_period, shutdown).await
-        } else {
-            shutdown.await;
-            Ok(())
-        };
+        // The caller may run on a managed runtime (e.g. a partition processor's) which this
+        // shutdown tears down. Drive the shutdown on the default runtime so that it, including
+        // its timeout, keeps running even if the caller's future gets dropped.
+        let this = Arc::clone(self);
+        let reason = reason.to_owned();
+        if let Some(grace_period) = grace_period
+            && self.shutdown_watchdog_enabled.load(Ordering::Relaxed)
+        {
+            start_shutdown_watchdog(grace_period * 2, exit_code);
+        }
+        let shutdown = self.default_runtime_handle.spawn(
+            CURRENT_TASK_CENTER
+                .scope(Handle::new(self), async move {
+                    let start = Instant::now();
+                    let shutdown = this.shutdown_node_inner(&reason, exit_code);
+                    let shutdown_result = if let Some(grace_period) = grace_period {
+                        tokio::time::timeout(grace_period, shutdown).await
+                    } else {
+                        shutdown.await;
+                        Ok(())
+                    };
 
-        if shutdown_result.is_err() {
-            warn!(
-                "Timeout waiting for graceful shutdown. Shutdown took {:?}",
-                start.elapsed()
-            );
-        } else {
-            info!("Restate has gracefully shutdown in {:?}", start.elapsed());
-        };
-        self.root_task_context.cancel();
-        self.global_cancel_token.cancel();
+                    if shutdown_result.is_err() {
+                        warn!(
+                            "Timeout waiting for graceful shutdown. Shutdown took {:?}",
+                            start.elapsed()
+                        );
+                    } else {
+                        info!("Restate has gracefully shutdown in {:?}", start.elapsed());
+                    };
+                    this.root_task_context.cancel();
+                    this.global_cancel_token.cancel();
+                })
+                .in_current_span(),
+        );
+        // A failed join means the default runtime is going away; nothing left to wait for.
+        let _ = shutdown.await;
     }
 
     async fn shutdown_node_inner(self: &Arc<Self>, reason: &str, exit_code: i32) {
@@ -1130,8 +1158,6 @@ impl TaskCenterInner {
 
         // Stop log-server role
         self.cancel_tasks(Some(TaskKind::LogServerRole), None).await;
-        self.cancel_tasks(Some(TaskKind::LogStoreWriter), None)
-            .await;
 
         // stop metadata server
         self.cancel_tasks(Some(TaskKind::MetadataServer), None)
@@ -1271,49 +1297,75 @@ impl TaskCenterInner {
     }
 }
 
-/// This wrapper function runs in a newly-spawned task. It initializes the
-/// task-local variables and wraps the inner future.
-async fn wrapper<F>(inner: Arc<TaskCenterInner>, context: TaskContext, future: F)
+/// Exits the process once `deadline` has passed. Runs on a dedicated OS thread so that it does not
+/// depend on any (possibly stuck) async runtime. A shutdown that completes in time ends the process
+/// before the deadline.
+fn start_shutdown_watchdog(deadline: Duration, exit_code: i32) {
+    // Not completing the shutdown is a failure, even if the shutdown itself was requested cleanly.
+    let exit_code = if exit_code == 0 {
+        EXIT_CODE_FAILURE
+    } else {
+        exit_code
+    };
+    let result = std::thread::Builder::new()
+        .name("shutdown-watchdog".to_owned())
+        .spawn(move || {
+            std::thread::sleep(deadline);
+            // Use stderr since tracing might be stuck as well.
+            eprintln!(
+                "!!! Restate did not shut down within {:.1}s, exiting with code {exit_code}",
+                deadline.as_secs_f64()
+            );
+            std::process::exit(exit_code);
+        });
+    if let Err(err) = result {
+        warn!(%err, "Failed to start the shutdown watchdog");
+    }
+}
+
+/// Capture task-local scopes before spawning, then finish outside those scopes.
+fn wrapper<F>(
+    inner: Arc<TaskCenterInner>,
+    context: TaskContext,
+    future: F,
+) -> impl Future<Output = ()>
 where
     F: Future<Output = anyhow::Result<()>> + 'static,
 {
     let id = context.id;
-    trace!(kind = ?context.kind, name = ?context.name, "Starting task {}", context.id);
-
-    let result = CURRENT_TASK_CENTER
-        .scope(
-            Handle::new(&inner),
-            OVERRIDES.scope(
-                OVERRIDES.try_with(Clone::clone).unwrap_or_default(),
-                TASK_CONTEXT.scope(
-                    context,
-                    // We use AssertUnwindSafe here so that the wrapped function
-                    // doesn't need to be UnwindSafe. We should not do anything after
-                    // unwinding that'd risk us being in unwind-unsafe behavior.
-                    AssertUnwindSafe(future).catch_unwind(),
-                ),
-            ),
-        )
-        .await;
-    inner.on_finish(id, result).await;
+    unmanaged_wrapper(
+        Arc::clone(&inner),
+        context,
+        // The wrapped future need not be UnwindSafe. Cleanup must not rely on
+        // its state after unwinding.
+        AssertUnwindSafe(future).catch_unwind(),
+    )
+    // Then stores the scoped future and cleanup future in successive states,
+    // rather than capturing the large input in another async wrapper.
+    .then(move |result| async move { inner.on_finish(id, result).await })
 }
 
-/// Like wrapper but doesn't call on_finish nor it catches panics
-async fn unmanaged_wrapper<F, T>(inner: Arc<TaskCenterInner>, context: TaskContext, future: F) -> T
+/// Like wrapper but doesn't call on_finish nor catch panics.
+/// Capture overrides at construction, before the future crosses a task boundary.
+/// Return the scopes directly: an async wrapper can reserve space for both F
+/// and the scoped future containing F in its coroutine layout.
+fn unmanaged_wrapper<F, T>(
+    inner: Arc<TaskCenterInner>,
+    context: TaskContext,
+    future: F,
+) -> impl Future<Output = T>
 where
     F: Future<Output = T> + 'static,
 {
     trace!(kind = ?context.kind, name = ?context.name, "Starting task {}", context.id);
 
-    CURRENT_TASK_CENTER
-        .scope(
-            Handle::new(&inner),
-            OVERRIDES.scope(
-                OVERRIDES.try_with(Clone::clone).unwrap_or_default(),
-                TASK_CONTEXT.scope(context, future),
-            ),
-        )
-        .await
+    CURRENT_TASK_CENTER.scope(
+        Handle::new(&inner),
+        OVERRIDES.scope(
+            OVERRIDES.try_with(Clone::clone).unwrap_or_default(),
+            TASK_CONTEXT.scope(context, future),
+        ),
+    )
 }
 
 /// Access to this node id. This is available in task-center tasks only!
@@ -1380,6 +1432,161 @@ mod tests {
 
     use super::*;
     use crate as restate_core;
+
+    #[tokio::test]
+    async fn managed_scopes_inherit_overrides_and_finish_all_outcomes() {
+        let tc = TaskCenterBuilder::default()
+            .default_runtime_handle(tokio::runtime::Handle::current())
+            .build()
+            .unwrap()
+            .into_handle();
+        let data = [0u8; 32 * 1024];
+        let input = async move {
+            std::future::pending::<()>().await;
+            std::hint::black_box(data);
+            Ok(())
+        };
+        let input_size = std::mem::size_of_val(&input);
+        let wrapped = wrapper(tc.inner.clone(), tc.inner.root_task_context.clone(), input);
+        // Allow fixed wrapper overhead, but not another inline copy of the input.
+        assert!(std::mem::size_of_val(&wrapped) < input_size + 4096);
+        drop(wrapped);
+
+        let metadata = crate::MetadataBuilder::default().to_metadata();
+        for outcome in 0..3 {
+            let (tx, rx) = oneshot::channel();
+            let id = tc.run_sync(|| {
+                OVERRIDES.sync_scope(
+                    GlobalOverrides {
+                        metadata: Some(metadata.clone()),
+                    },
+                    || {
+                        TaskCenter::spawn(TaskKind::Disposable, "managed-scope-test", async move {
+                            tokio::task::yield_now().await;
+                            assert!(TaskCenter::with_metadata(|_| ()).is_some());
+                            tx.send(current_task_id().unwrap()).unwrap();
+                            match outcome {
+                                0 => Ok(()),
+                                1 => Err(anyhow::anyhow!("expected managed error")),
+                                _ => panic!("expected managed panic"),
+                            }
+                        })
+                        .unwrap()
+                    },
+                )
+            });
+            assert_eq!(rx.await.unwrap(), id);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while tc.inner.managed_tasks.lock().contains_key(&id) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!tc.inner.shutdown_requested.load(Ordering::Acquire));
+            assert!(TaskCenter::try_current().is_none());
+            assert!(OVERRIDES.try_with(|_| ()).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn unmanaged_scopes_capture_restore_and_keep_future_inline_once() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        struct Probe {
+            bytes: [u8; 32 * 1024],
+            id: TaskId,
+            dropped: Arc<AtomicBool>,
+        }
+        impl Future for Probe {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+                assert_eq!(current_task_id(), Some(self.id));
+                assert!(TaskCenter::with_metadata(|_| ()).is_some());
+                std::hint::black_box(&self.bytes);
+                Poll::Pending
+            }
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                assert_eq!(current_task_id(), Some(self.id));
+                assert!(TaskCenter::with_metadata(|_| ()).is_some());
+                self.dropped.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let tc = TaskCenterBuilder::default()
+            .default_runtime_handle(tokio::runtime::Handle::current())
+            .build()
+            .unwrap()
+            .into_handle();
+        let metadata = crate::MetadataBuilder::default().to_metadata();
+        let mut context = tc.inner.root_task_context.clone();
+        context.id = TaskId::default();
+        let id = context.id;
+        let dropped = Arc::new(AtomicBool::new(false));
+        let wrapped = OVERRIDES.sync_scope(
+            GlobalOverrides {
+                metadata: Some(metadata.clone()),
+            },
+            || {
+                unmanaged_wrapper(
+                    tc.inner.clone(),
+                    context.clone(),
+                    Probe {
+                        bytes: [0; 32 * 1024],
+                        id,
+                        dropped: dropped.clone(),
+                    },
+                )
+            },
+        );
+        // A generous fixed overhead budget catches an extra inline copy of F,
+        // without depending on exact compiler or task-local layout sizes.
+        assert!(std::mem::size_of_val(&wrapped) < std::mem::size_of::<Probe>() + 1024);
+        let mut wrapped = Box::pin(wrapped);
+        tc.run_sync(|| {
+            let parent = current_task_id();
+            assert!(TaskCenter::with_metadata(|_| ()).is_none());
+            assert!(wrapped.as_mut().now_or_never().is_none());
+            assert_eq!(current_task_id(), parent);
+            assert!(TaskCenter::with_metadata(|_| ()).is_none());
+            drop(wrapped);
+            assert!(dropped.load(Ordering::Relaxed));
+            assert_eq!(current_task_id(), parent);
+            assert!(TaskCenter::with_metadata(|_| ()).is_none());
+        });
+        assert!(TaskCenter::try_current().is_none());
+        assert!(current_task_id().is_none());
+        assert!(OVERRIDES.try_with(|_| ()).is_err());
+
+        // Cross an actual Tokio task boundary: overrides must be captured before
+        // spawn, not looked up on the first poll in the new task.
+        let task = tc.run_sync(|| {
+            OVERRIDES.sync_scope(
+                GlobalOverrides {
+                    metadata: Some(metadata),
+                },
+                || {
+                    tokio::spawn(unmanaged_wrapper(tc.inner.clone(), context, async move {
+                        tokio::task::yield_now().await;
+                        assert_eq!(current_task_id(), Some(id));
+                        assert!(TaskCenter::with_metadata(|_| ()).is_some());
+                        panic!("unmanaged panic must propagate");
+                    }))
+                },
+            )
+        });
+        let panic = task.await.unwrap_err().into_panic();
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"unmanaged panic must propagate")
+        );
+        assert!(TaskCenter::try_current().is_none());
+        assert!(OVERRIDES.try_with(|_| ()).is_err());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn finalizers_wait_for_existing_shutdown() -> Result<()> {
@@ -1570,6 +1777,84 @@ mod tests {
         tc.start_runtime(TaskKind::SystemService, "shutdown-test", None, || async {})?
             .await;
         assert!(tc.inner.managed_runtimes.lock().is_empty());
+        Ok(())
+    }
+
+    /// A panic in a shutdown-on-error task running on a managed runtime must complete the node
+    /// shutdown, even though the shutdown tears down the runtime the panicking task ran on.
+    #[tokio::test]
+    async fn panic_on_managed_runtime_completes_shutdown() -> Result<()> {
+        async fn panicking_task() -> anyhow::Result<()> {
+            panic!("boom")
+        }
+
+        let tc = TaskCenterBuilder::default()
+            .default_runtime_handle(tokio::runtime::Handle::current())
+            .build()?
+            .into_handle();
+        // Makes the shutdown yield after it asked the managed runtime to stop.
+        tc.spawn(TaskKind::MetadataServer, "slow-to-stop", async {
+            cancellation_watcher().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(())
+        })?;
+        let runtime =
+            tc.start_runtime(TaskKind::PartitionProcessor, "pp-test", None, || async {
+                TaskCenter::spawn_child(TaskKind::LogTrimmer, "log-trimmer", panicking_task())
+                    .unwrap();
+                cancellation_watcher().await;
+            })?;
+
+        tokio::time::timeout(Duration::from_secs(10), tc.shutdown_token().cancelled())
+            .await
+            .expect("node shutdown completes");
+        assert_eq!(
+            tc.inner.current_exit_code.load(Ordering::Relaxed),
+            EXIT_CODE_FAILURE
+        );
+        runtime.await;
+        assert!(tc.inner.managed_runtimes.lock().is_empty());
+        Ok(())
+    }
+
+    /// The shutdown watchdog must exit the process even if the runtime driving the shutdown is
+    /// blocked. Since that kills the process, the test re-runs itself in a child process.
+    #[tokio::test]
+    async fn shutdown_watchdog_exits_stuck_process() -> Result<()> {
+        const CHILD_ENV: &str = "RESTATE_TEST_SHUTDOWN_WATCHDOG_CHILD";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let mut config = Configuration::default();
+            config.common.shutdown_timeout =
+                restate_util_time::NonZeroFriendlyDuration::from_secs_unchecked(1);
+            restate_types::config::set_current_config(config);
+
+            let tc = TaskCenterBuilder::default()
+                .default_runtime_handle(tokio::runtime::Handle::current())
+                .build()?
+                .into_handle();
+            tc.enable_shutdown_watchdog();
+            // Blocks the only runtime thread, so the shutdown timeout can never fire.
+            tc.set_on_shutdown(Box::pin(async {
+                std::thread::sleep(Duration::from_secs(20));
+            }));
+            tc.shutdown_node("test", 3).await;
+            unreachable!("the watchdog exits the process");
+        }
+
+        let start = std::time::Instant::now();
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "task_center::tests::shutdown_watchdog_exits_stuck_process",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()?;
+
+        assert_eq!(output.status.code(), Some(3));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("did not shut down within"));
+        assert!(start.elapsed() < Duration::from_secs(30));
         Ok(())
     }
 }

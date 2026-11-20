@@ -24,9 +24,8 @@ use futures::stream;
 
 use restate_bifrost::read_stream_registry::{ActiveReadStreamRegistry, ReadStreamState};
 use restate_core::Metadata;
-use restate_storage_query_datafusion::Scan;
-use restate_storage_query_datafusion::bifrost_read_stream::BifrostReadStreamsBuilder;
-use restate_storage_query_datafusion::table_util::Builder;
+use restate_storage_query_api::Scan;
+use restate_storage_query_api::tables::bifrost_read_streams::BifrostReadStreamsBatchBuilder as BifrostReadStreamsBuilder;
 use restate_types::GenerationalNodeId;
 use restate_types::logs::{Lsn, SequenceNumber};
 
@@ -72,7 +71,7 @@ impl Scan for BifrostReadStreamsScanner {
                 append_row(&mut builder, my_node_id, state);
             }
 
-            builder.finish()
+            builder.into_batch()
         };
 
         Box::pin(RecordBatchStreamAdapter::new(projection, stream::once(fut)))
@@ -89,6 +88,12 @@ fn append_row(
     row.fmt_plain_node_id(node_id.as_plain());
     row.fmt_gen_node_id(node_id);
     row.log_id(u32::from(state.log_id));
+    if let Some(name) = &state.name {
+        row.fmt_name(name);
+    }
+    if let Some(role) = &state.role {
+        row.fmt_role(role);
+    }
     row.read_pointer(u64::from(state.read_pointer));
     row.end_lsn(u64::from(state.end_lsn));
     row.fmt_state(state.state);
@@ -106,4 +111,6 @@ fn append_row(
     }
 
     row.is_tailing(state.end_lsn == Lsn::MAX);
+    row.records_read(state.records_read);
+    row.bytes_read(state.bytes_read);
 }

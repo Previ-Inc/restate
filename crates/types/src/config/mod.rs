@@ -414,6 +414,9 @@ impl Configuration {
     }
 
     pub fn apply_cascading_values(mut self) -> Self {
+        self.common
+            .rocksdb
+            .fold_deprecated_l0_l1_compression(RocksDbCompression::default());
         self.worker.storage.apply_common(&self.common);
         self.bifrost.apply_common(&self.common);
         self.bifrost.set_derived_values(&self.networking);
@@ -498,6 +501,20 @@ impl Configuration {
             return Err(InvalidConfigurationError::ForceNodeIdZero);
         }
 
+        // Matches the visible-ASCII rule the invoker applies to its outbound
+        // `x-restate-cluster-name`, so callers can always send and compare it.
+        if self.common.reject_misdirected_requests
+            && !self
+                .common
+                .cluster_name()
+                .chars()
+                .all(|c| (' '..='~').contains(&c))
+        {
+            return Err(InvalidConfigurationError::InvalidClusterName {
+                cluster_name: self.common.cluster_name().to_owned(),
+            });
+        }
+
         if self.common.node_name.is_none() {
             // If the node name is not set, we will fallback to use hostname as the node name.
             // So to avoid changing hostname to make data loss, we must validate the directory's entry.
@@ -526,6 +543,11 @@ impl Configuration {
                 }
             }
         }
+
+        self.worker
+            .snapshots
+            .validate_upload_sizes()
+            .map_err(InvalidConfigurationError::InvalidSnapshotUploadSizes)?;
 
         self.validate_advertised_addresses()
     }
@@ -691,12 +713,18 @@ pub enum InvalidConfigurationError {
     DeriveBindAddress(String),
     #[error("node-name is required: {0}")]
     RequiredNodeName(String),
+    #[error(
+        "cluster-name '{cluster_name}' must be visible ASCII when reject-misdirected-requests is enabled"
+    )]
+    InvalidClusterName { cluster_name: String },
     #[error("invalid {key} '{address}': {reason}")]
     AdvertisedAddress {
         key: &'static str,
         address: String,
         reason: String,
     },
+    #[error("invalid [worker.snapshots] setting: {0}")]
+    InvalidSnapshotUploadSizes(String),
     #[error("invalid {key}: {reason}")]
     AdvertisedAddressList { key: &'static str, reason: String },
 }
@@ -943,7 +971,7 @@ mod tests {
     }
 
     #[test]
-    fn http2_max_connection_age_is_raised_to_minimum() {
+    fn http2_max_connection_age_resolution() {
         let parse = |age: Option<&str>| {
             let config = Configuration::default();
             let mut json = serde_json::to_value(&config).unwrap();
@@ -959,18 +987,47 @@ mod tests {
                 .http2_max_connection_age()
         };
 
-        let min = std::time::Duration::from_secs(10 * 60);
-        // Unset: no age-based eviction.
-        assert_eq!(parse(None), None);
-        // Below the minimum: raised to 10 minutes.
+        let min = std::time::Duration::from_secs(30);
+        // Unset: defaults to 5 minutes.
+        assert_eq!(parse(None), Some(std::time::Duration::from_secs(300)));
+        // Zero: no age-based eviction.
+        assert_eq!(parse(Some("0")), None);
+        // Below the minimum: raised to 30 seconds.
         assert_eq!(parse(Some("1s")), Some(min));
-        assert_eq!(parse(Some("9m 59s")), Some(min));
+        assert_eq!(parse(Some("29s")), Some(min));
         // At or above the minimum: kept as configured.
-        assert_eq!(parse(Some("10m")), Some(min));
+        assert_eq!(parse(Some("30s")), Some(min));
+        assert_eq!(parse(Some("45s")), Some(std::time::Duration::from_secs(45)));
         assert_eq!(
             parse(Some("1h")),
             Some(std::time::Duration::from_secs(3600))
         );
+    }
+
+    #[test]
+    fn validate_requires_header_safe_cluster_name_for_misdirected_requests() {
+        let config = |cluster_name: &str, reject: bool| {
+            let mut json = serde_json::to_value(Configuration::default()).unwrap();
+            json["cluster-name"] = json!(cluster_name);
+            json["reject-misdirected-requests"] = json!(reject);
+            serde_json::from_value::<Configuration>(json).unwrap()
+        };
+
+        // With the option off, an unusable cluster name is still accepted.
+        assert!(config("invalid\ncluster", false).validate().is_ok());
+
+        let err = config("invalid\ncluster", true).validate().unwrap_err();
+        assert!(matches!(
+            err,
+            InvalidConfigurationError::InvalidClusterName { .. }
+        ));
+
+        assert!(matches!(
+            config("clüster", true).validate().unwrap_err(),
+            InvalidConfigurationError::InvalidClusterName { .. }
+        ));
+
+        assert!(config("valid-cluster", true).validate().is_ok());
     }
 
     #[test]

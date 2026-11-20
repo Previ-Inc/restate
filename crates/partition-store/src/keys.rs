@@ -8,9 +8,197 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+//! # Keys in the partition store
+//!
+//! Every key starts with a two-byte [`KeyKind`] that names the table the key
+//! belongs to, so one column family can hold many tables. Most tables then put
+//! the partition key and their own fields after it; this is the common table-key
+//! layout:
+//!
+//! ```text
+//! | kind (2) | partition key (8) | field | field | … |
+//! ```
+//!
+//! Some tables use a layout of their own. Statistics, for example, start with a
+//! compact header that carries the partition ID rather than a partition key
+//! (`stats::AggregateKeyPrefix`), and so do the registry's records
+//! (`registry::records::RecordKey`). The key kind always comes first.
+//!
+//! RocksDB sorts keys by their bytes, so how each field is encoded decides the
+//! order a scan sees and which lookups are possible. There are two ways to encode
+//! fields here, and this module holds both.
+//!
+//! ## 1. Table keys: `define_table_key!`
+//!
+//! Most tables declare their key with [`define_table_key!`]. It generates the key
+//! struct, a builder for prefixes, and the [`EncodeTableKey`], [`DecodeTableKey`]
+//! and [`EncodeTableKeyPrefix`] implementations. Each field keeps the encoding the
+//! table has always used, through the crate-private [`KeyEncode`] and
+//! [`KeyDecode`] traits: integers as big-endian, strings as a varint length
+//! followed by the bytes. These keys support point lookups and scans of a prefix
+//! of leading fields. They are **not ordered across all fields**: a
+//! length-prefixed string sorts `"b"` before `"aa"`, because the lengths `1` and
+//! `2` are compared first. Never change an existing table key's encoding; the
+//! bytes are on disk.
+//!
+//! ## 2. Field codecs: `FieldCodec` and friends
+//!
+//! A **field codec** is a type that says exactly how one field is laid out and
+//! what that layout promises. An ordered codec makes byte comparison of its
+//! encodings follow the order the codec defines, so concatenating such fields
+//! produces an **ordered**, also called **mem-comparable**, key. A planner
+//! translates a query's supported predicates into that order before choosing
+//! scan bounds. The codecs live in [`codecs`]; writers that build keys and
+//! planners that choose scan bounds share them.
+//!
+//! For example, encoding `(stage, service_name, transitioned_at descending,
+//! entry_id)` with `StageRankCodec`, `ServiceNameCodec`,
+//! `ReverseUniqueTimestampCodec` and `CanonicalEntryIdCodec` yields keys that a
+//! forward scan, with the first two fields fixed, visits newest first.
+//!
+//! What a codec promises is graded by three traits:
+//!
+//! | Trait | Promise | Use it for |
+//! | --- | --- | --- |
+//! | [`FieldCodec`] | a byte layout with lengths, boundaries and decoding; no ordering | every codec |
+//! | [`OrderedFieldCodec`] | additionally canonical (one encoding per value), prefix-free (no encoding is the start of another) and ordered bytewise in a codec-defined order | any field of an ordered key; a planner translates logical predicates into the codec's order before deriving scan bounds |
+//! | [`TerminalFieldCodec`] | canonical and equality-preserving; consumes the rest of the key and need not be prefix-free; no ordering | the last field only, such as a raw lock name, where only equality and membership predicates apply |
+//!
+//! Descending order is a codec, not a flag: `ReverseU64Codec` and
+//! `ReverseUniqueTimestampCodec` sort largest first. `Option<C>` is a codec too:
+//! a one-byte tag, with `None` sorting first.
+//!
+//! ### Legacy codecs
+//!
+//! [`codecs::DelimitedBytesCodec`], [`codecs::OptionalScopeCodec`] and
+//! [`codecs::LockNameCodec`] describe the bytes that existing table keys already
+//! write, so that scan planning can work over them *without changing the format*.
+//! The first two are prefix-free and canonical, but not in logical order, so over
+//! them a selection can turn equality and membership into key lookups, while
+//! ranges and string prefixes stay as filters applied after the scan.
+//! `LockNameCodec` is different: a raw lock name is not prefix-free (`Cart/a`
+//! starts `Cart/ab`), so it is a terminal codec that consumes the rest of the
+//! key and supports equality and membership only.
+//!
+//! ## Which to reach for
+//!
+//! | You want to… | Use |
+//! | --- | --- |
+//! | add a table with point lookups and prefix scans | [`define_table_key!`] |
+//! | read or write a table key, or a scan prefix | [`EncodeTableKey`], [`DecodeTableKey`], [`EncodeTableKeyPrefix`]; [`FixedLengthTableKey::to_bytes`] for keys of fixed size |
+//! | encode a field of an ordered key | a [`codecs`] type implementing [`OrderedFieldCodec`] |
+//! | decode fields one at a time without copying | [`FieldDecoder`], which borrows one field and decodes it on demand |
+//! | plan scans over an existing table's keys | the legacy codecs |
+//! | add a new codec | implement [`FieldCodec`]; add [`OrderedFieldCodec`] only if the ordering contract holds; keep enum codes stable and leave gaps for future variants |
+//!
+//! ## Existing non-ordered table layouts
+//!
+//! These active table-key layouts are **not ordered across all logical fields**:
+//!
+//! | Key kind | Fields preventing logical field ordering |
+//! | --- | --- |
+//! | [`State`](KeyKind::State) | Length-prefixed `service_name`, `service_key`, and `state_key`. |
+//! | [`ScopedState`](KeyKind::ScopedState) | Legacy optional `scope`, plus length-prefixed `service_name`, `service_key`, and `state_key`. |
+//! | [`Promise`](KeyKind::Promise) | Length-prefixed `service_name`, `service_key`, and `key`. |
+//! | [`ScopedPromise`](KeyKind::ScopedPromise) | Legacy optional `scope`, plus length-prefixed `service_name`, `service_key`, and `key`. |
+//! | [`Inbox`](KeyKind::Inbox) | Length-prefixed `service_name` and `service_key`. |
+//! | [`ServiceStatus`](KeyKind::ServiceStatus) | Length-prefixed `service_name` and `service_key`. |
+//! | [`Deduplication`](KeyKind::Deduplication) | The `ProducerId::Other` variant contains a length-prefixed string. |
+//! | [`Lock`](KeyKind::Lock) | The optional scope uses legacy tags and a length-prefixed name; the raw lock name is suffix-only. |
+//!
+//! Their exact-key lookups and table-specific scans still work. In particular,
+//! partition-key prefixes remain ordered, and inbox sequence numbers are ordered
+//! within a fixed service identity. These local properties do not make the entire
+//! layout suitable for generic ordered-field filters.
+//!
+//! Conversely, `define_table_key!` does not imply that a layout is unordered:
+//! [`Outbox`](KeyKind::Outbox), for example, uses ordered fixed-width integer fields.
+//! Also distinguish suffix-only ordering from composable field encoding:
+//! [`JournalV2NotificationIdToNotificationIndex`](KeyKind::JournalV2NotificationIdToNotificationIndex)
+//! stores named signals as raw trailing bytes. Names compare lexicographically at
+//! the end of that key, but this representation is not prefix-free and cannot be
+//! followed by another field. Neither macro choice nor a shared value type alone
+//! certifies a legacy layout for the ordered-field machinery.
+//!
+//! ## Ordered keys and their payload
+//!
+//! An ordered key is a fixed **header**, the physical identity of the key (its
+//! kind, partition, index, …), followed by a **payload** of concatenated fields,
+//! each encoded with its [`FieldCodec`]. [`header::KeySchema`] declares the header
+//! and the scope a read covers; the generated [`KeyEncode`] writes only the
+//! payload, and prefix builders write the header followed by the leading fields
+//! the caller supplies.
+//!
+//! ## Field ordering and NULLs
+//!
+//! Within a fixed physical identity, ordered fields compare lexicographically by
+//! their encoded bytes, in physical declaration order. For example, a nullable
+//! string followed by a descending integer (`Option<&str>`, `Reverse<u64>`) produces
+//! this ascending byte order:
+//!
+//! ```text
+//! (None,       Reverse(0))
+//! (Some(""),   Reverse(0))
+//! (Some("a"),  Reverse(9))
+//! (Some("a"),  Reverse(2))
+//! (Some("aa"), Reverse(0))
+//! ```
+//!
+//! `Option<C>` wraps codec `C` with a presence tag: `[0]` for `None`, or `[1]` followed by the
+//! complete inner encoding for `Some`. NULLs therefore sort before all values,
+//! even when the inner codec is descending. The tag preserves prefix-freedom:
+//! no **complete field encoding** is a proper prefix of another for the same codec.
+//! Sharing a tag prefix is allowed. See [`OrderedFieldCodec`] for the contract
+//! and an executable example, including strings where one is a prefix of another.
+//!
+//! ## Decoding and selection
+//!
+//! [`KeyDecoder`] decodes an ordered payload after the header has been checked and
+//! removed, into owned values or borrowed [`FieldDecoder`] views, so a reader
+//! materializes only the fields it needs. Taking a view checks the field's encoded
+//! boundary; value checks happen when the field is decoded. Legacy full-key codecs
+//! may keep the header.
+//!
+//! A [`selection`] binds a logical selection's clauses to these fields, prepares
+//! encoded comparisons and derives the enclosing scan interval; its cursor then
+//! checks each visited key and seeks forward across rejected groups of keys. Field
+//! declaration order determines key order, whatever the order of the logical
+//! clauses.
+
 // Allow deprecated KeyKind variants - needed because derive macros (EnumIter, VariantArray)
 // generate code that references all variants including deprecated ones.
 #![allow(deprecated)]
+
+mod codec;
+mod fields;
+pub mod header;
+mod index;
+mod key_decoder;
+mod legacy_codec;
+pub(crate) mod macros;
+mod ordered_key_codec;
+pub(crate) mod predicate;
+pub mod selection;
+
+// Re-exports
+pub use codec::{
+    EncodedOption, FieldCodec, FieldDecoder, IntoFieldRef, OrderedFieldCodec, TerminalFieldCodec,
+};
+
+/// Physical representations selected explicitly by ordered-key schemas.
+pub mod codecs {
+    pub use super::fields::{ServiceNameCodec, StringCodec, U8Codec, U32Codec, U64Codec};
+    pub use super::legacy_codec::{DelimitedBytesCodec, LockNameCodec, OptionalScopeCodec};
+    pub use super::ordered_key_codec::{
+        CanonicalEntryIdCodec, EntryIdCodec, EntryKindCodec, InvocationUuidCodec,
+        RestateEpochMillisCodec, ReverseBoolCodec, ReverseU64Codec, ReverseUniqueTimestampCodec,
+        RoughTimestampCodec, SeqCodec, StageRankCodec, StatusCodec, VQueueIdCodec,
+        VQueueIdSuffixCodec,
+    };
+}
+
+pub use index::{IndexKeyHeader, IndexKeyPrefix};
+pub use key_decoder::KeyDecoder;
 
 use std::mem;
 
@@ -18,10 +206,11 @@ use anyhow::anyhow;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use bytestring::ByteString;
 use prost::encoding::encoded_len_varint;
-use rocksdb::MergeOperands;
+use rocksdb::{CompactionDecision, MergeOperands};
 use strum::EnumIter;
 use tracing::{error, trace};
 
+use restate_types::blob::BlobId;
 use restate_types::clock::UniqueTimestamp;
 use restate_types::{Scope, ServiceName};
 use restate_util_string::{ReString, RestateString};
@@ -91,6 +280,27 @@ pub enum KeyKind {
     // # Locks
     // locks for scoped and unscoped virtual objects and workflows
     Lock,
+    // # Blob
+    // stores large values (e.g. invocation outputs) separated from
+    // the records referencing them
+    Blob,
+
+    /// Secondary indexes
+    /// All secondary indexes are stored under a single key kind.
+    SecondaryIndex,
+
+    /// Partition-level statistics: aggregate indexes keyed by the registry's `u32`
+    /// index ID (see `crate::stats`).
+    Stats,
+    /// Retired. A pre-release build kept statistics under this kind with a
+    /// different layout. Nothing decodes or writes them, a later commit deletes
+    /// them when a store opens, and the bytes are never reused.
+    #[deprecated(note = "statistics of a pre-release build; deleted at open, never read")]
+    LegacyStats,
+
+    /// The partition's registry records: the registry, its walks and its
+    /// migration jobs, one key each (see `crate::registry::records`).
+    Registry,
 }
 
 impl KeyKind {
@@ -154,6 +364,17 @@ impl KeyKind {
             KeyKind::VQueueSuspendedStage => b"qS",
             KeyKind::VQueuePausedStage => b"qP",
             KeyKind::VQueueFinishedStage => b"qF",
+            KeyKind::Blob => b"bl",
+
+            // xI prefix for secondary indexes
+            KeyKind::SecondaryIndex => b"xI",
+
+            // Partition-level statistics; they are rebuilt on partition split.
+            KeyKind::Stats => b"zR",
+            KeyKind::LegacyStats => b"zS",
+
+            // The registry, its walks and its migration jobs.
+            KeyKind::Registry => b"rg",
         }
     }
 
@@ -167,6 +388,7 @@ impl KeyKind {
     /// ```
     pub const fn from_bytes(bytes: &[u8; Self::SERIALIZED_LENGTH]) -> Option<Self> {
         match bytes {
+            b"bl" => Some(KeyKind::Blob),
             b"de" => Some(KeyKind::Deduplication),
             b"fs" => Some(KeyKind::Fsm),
             b"ip" => Some(KeyKind::Idempotency),
@@ -197,6 +419,10 @@ impl KeyKind {
             b"qS" => Some(KeyKind::VQueueSuspendedStage),
             b"qP" => Some(KeyKind::VQueuePausedStage),
             b"qF" => Some(KeyKind::VQueueFinishedStage),
+            b"xI" => Some(KeyKind::SecondaryIndex),
+            b"zR" => Some(KeyKind::Stats),
+            b"zS" => Some(KeyKind::LegacyStats),
+            b"rg" => Some(KeyKind::Registry),
             _ => None,
         }
     }
@@ -235,24 +461,62 @@ impl KeyKind {
 
         match kind {
             KeyKind::VQueueMeta => vqueue_meta_merge::full_merge(key, existing_val, operands),
+            KeyKind::Blob => blob_table::merge::full_merge(key, existing_val, operands),
+            KeyKind::Stats => crate::stats::full_merge(key, existing_val, operands),
+            // A later commit deletes retired keys at open. Until then, keep whatever
+            // is stored rather than failing the merge, which would fail the compaction.
+            KeyKind::LegacyStats => Some(existing_val.unwrap_or_default().to_vec()),
             _ => None,
         }
     }
 
     // Rocksdb merge operator function (partial merge)
-    #[inline]
     pub fn partial_merge(
-        _key: &[u8],
+        key: &[u8],
         _unused: Option<&[u8]>,
-        _operands: &MergeOperands,
+        operands: &MergeOperands,
     ) -> Option<Vec<u8>> {
-        // Currently, we have no partial merge operator for any key. Change this
-        // if/when this is needed.
-        None
+        let mut kind_buf = key;
+        let kind = match KeyKind::deserialize(&mut kind_buf) {
+            Ok(kind) => kind,
+            Err(e) => {
+                error!("Cannot apply merge operator; {e}");
+                return None;
+            }
+        };
+        trace!(?kind, "partial merge {} operands", operands.len());
+
+        match kind {
+            KeyKind::Blob => blob_table::merge::partial_merge(key, operands),
+            KeyKind::Stats => crate::stats::partial_merge(key, operands),
+            _ => None,
+        }
+    }
+
+    pub fn compaction_filter(_lvl: u32, key: &[u8], value: &[u8]) -> CompactionDecision {
+        let mut kind_buf = key;
+        let kind = match KeyKind::deserialize(&mut kind_buf) {
+            Ok(kind) => kind,
+            Err(e) => {
+                error!("Cannot apply compaction filter; {e}");
+                return CompactionDecision::Keep;
+            }
+        };
+        trace!(?kind, "compaction filter");
+
+        match kind {
+            KeyKind::Blob => blob_table::merge::compaction_filter(key, value),
+            KeyKind::Stats => crate::stats::compaction_filter(key, value),
+            KeyKind::Registry => crate::registry::records::compaction_filter(key, value),
+            _ => CompactionDecision::Keep,
+        }
     }
 }
 
 /// Types that can be encoded to a full table key in partition store.
+///
+/// This trait does not guarantee logical field ordering; that depends on every
+/// field's selected codec. See the module guide on field codecs and legacy codecs.
 pub trait EncodeTableKey {
     const TABLE: TableKind;
     const KEY_KIND: KeyKind;
@@ -261,12 +525,26 @@ pub trait EncodeTableKey {
     fn serialized_length(&self) -> usize;
 }
 
+/// Table keys whose encoding is always exactly `N` bytes long.
+pub trait FixedLengthTableKey<const N: usize>: EncodeTableKey {
+    #[inline]
+    fn to_bytes(&self) -> [u8; N] {
+        debug_assert_eq!(self.serialized_length(), N);
+        let mut buf = [0u8; N];
+        self.serialize_to(&mut buf.as_mut());
+        buf
+    }
+}
+
 /// Types that can be decoded to an owned table key.
 pub trait DecodeTableKey: Sized + std::fmt::Debug + Send + 'static {
     fn deserialize_from(bytes: &mut &[u8]) -> crate::Result<Self>;
 }
 
 /// Types that can be encoded to perform a scan prefix in partition store.
+///
+/// A byte-prefix scan does not require the remaining fields to be mem-comparable
+/// and does not by itself establish logical ordering across those fields.
 pub trait EncodeTableKeyPrefix {
     const TABLE: TableKind;
     const KEY_KIND: KeyKind;
@@ -307,7 +585,13 @@ where
     }
 }
 
-/// The following macro defines an ordered, named key tuple, that is used as a rocksdb key.
+/// Defines a named, table-specific key tuple and its RocksDB prefix builders.
+///
+/// Fields are serialized in declaration order through `KeyEncode`, which does not
+/// guarantee mem-comparability. In particular, legacy string/byte fields are
+/// length-prefixed, so their byte order need not match their logical order. This
+/// macro preserves those layouts; it does not certify the key as ordered. The
+/// separate `define_ordered_key!` macro requires ordered codecs for every field.
 ///
 /// Given the following definition
 /// ```ignore
@@ -627,15 +911,24 @@ macro_rules! define_table_key {
 
 use crate::PaddedPartitionId;
 use crate::TableKind;
+use crate::blob_table;
 use crate::vqueue_table::vqueue_meta_merge;
 pub(crate) use define_table_key;
 use restate_storage_api::StorageError;
 use restate_storage_api::deduplication_table::ProducerId;
 use restate_storage_api::timer_table::TimerKeyKind;
-use restate_types::identifiers::InvocationUuid;
+use restate_types::identifiers::{InvocationUuid, ResourceId};
 use restate_types::journal_v2::{CompletionId, NotificationId, SignalIndex};
 
-pub(crate) trait KeyEncode {
+/// Encodes a table-specific field or key payload, without an ordering guarantee.
+///
+/// This includes both fixed-width ordered codecs and legacy non-mem-comparable
+/// codecs. String/byte encodings can be length-prefixed, and some codecs consume
+/// the remainder of the key. An implementation of this trait is not evidence that
+/// the bytes can be used for logical range comparisons or generic ordered filters.
+/// Select an [`OrderedFieldCodec`] for fields in ordered composite keys; the two
+/// traits may encode the same Rust type differently.
+pub trait KeyEncode {
     fn encode<B: BufMut>(&self, target: &mut B);
 
     fn serialized_length(&self) -> usize;
@@ -651,7 +944,9 @@ impl<T: KeyEncode> KeyEncode for &T {
     }
 }
 
-pub(crate) trait KeyDecode: Sized {
+/// Decodes the table-specific representation written by [`KeyEncode`].
+/// Field boundaries and ordering depend on that particular codec.
+pub trait KeyDecode: Sized {
     fn decode(source: &mut &[u8]) -> crate::Result<Self>;
 }
 
@@ -1064,6 +1359,8 @@ impl KeyDecode for TimerKeyKind {
     }
 }
 
+/// The `SignalName` variant writes raw trailing bytes and must be the final field.
+/// Names sort lexicographically there, but are not prefix-free/composable ordered fields.
 impl KeyEncode for NotificationId {
     fn encode<B: BufMut>(&self, target: &mut B) {
         assert!(
@@ -1128,6 +1425,28 @@ impl KeyDecode for NotificationId {
     }
 }
 
+impl KeyEncode for BlobId {
+    fn encode<B: BufMut>(&self, target: &mut B) {
+        target.put_slice(&self.to_bytes());
+    }
+
+    fn serialized_length(&self) -> usize {
+        BlobId::RAW_BYTES_LEN
+    }
+}
+
+impl KeyDecode for BlobId {
+    fn decode(source: &mut &[u8]) -> crate::Result<Self> {
+        let (bytes, rest) = source
+            .split_first_chunk::<{ BlobId::RAW_BYTES_LEN }>()
+            .ok_or(StorageError::DataIntegrityError)?;
+        *source = rest;
+        BlobId::from_slice(bytes).map_err(|_| StorageError::DataIntegrityError)
+    }
+}
+
+// Preserve the legacy, non-mem-comparable string format. The same value types
+// have separate ordered codecs in fields.rs.
 macro_rules! impl_string_key_codec {
     ($t:ty) => {
         impl KeyEncode for $t {
@@ -1290,7 +1609,11 @@ mod tests {
         assert_eq!(uuid, got);
     }
 
-    define_table_key!(TableKind::Deduplication, KeyKind::Deduplication, DeduplicationTestKey(value: u64));
+    define_table_key!(
+        TableKind::Deduplication,
+        KeyKind::Deduplication,
+        DeduplicationTestKey(value: u64)
+    );
 
     #[test]
     fn key_prefix_mismatch() {

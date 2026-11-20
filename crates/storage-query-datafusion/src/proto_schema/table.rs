@@ -15,13 +15,13 @@ use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::catalog::TableProvider;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchReceiverStream;
 use restate_types::schema::service::ServiceMetadataResolver;
 
 use super::DynamicProtoSchemaRegistry;
-use crate::context::QueryContext;
 use crate::statistics::{SERVICE_ROW_ESTIMATE, TableStatisticsBuilder};
 use crate::table_macro::*;
 use crate::table_providers::{GenericTableProvider, Scan};
@@ -49,20 +49,21 @@ define_table!(
     fields_json: DataType::LargeUtf8,
 ));
 
-pub(crate) fn register_self<SMR: ServiceMetadataResolver + Send + Sync + Clone + 'static>(
-    ctx: &QueryContext,
-    registry: DynamicProtoSchemaRegistry<SMR>,
-) -> datafusion::common::Result<()> {
-    let schema = SysProtoSchemasBuilder::schema();
-    let statistics =
-        TableStatisticsBuilder::new(schema).with_num_rows_estimate(SERVICE_ROW_ESTIMATE);
-    let table = GenericTableProvider::new(
-        SysProtoSchemasBuilder::schema(),
-        Arc::new(ProtoSchemasScanner(registry)),
-    )
-    .with_statistics(statistics.build());
+impl SysProtoSchemasTable {
+    pub(crate) fn create_provider<SMR: ServiceMetadataResolver + Send + Sync + Clone + 'static>(
+        registry: DynamicProtoSchemaRegistry<SMR>,
+    ) -> Arc<dyn TableProvider> {
+        let schema = SysProtoSchemasBuilder::schema();
+        let statistics =
+            TableStatisticsBuilder::new(schema).with_num_rows_estimate(SERVICE_ROW_ESTIMATE);
+        let table = GenericTableProvider::new(
+            SysProtoSchemasBuilder::schema(),
+            Arc::new(ProtoSchemasScanner(registry)),
+        )
+        .with_statistics(statistics.build());
 
-    ctx.register_non_partitioned_table("sys_proto_schemas", Arc::new(table))
+        Arc::new(table)
+    }
 }
 
 #[derive(Clone, derive_more::Debug)]

@@ -14,7 +14,9 @@ use bytes::Bytes;
 use bytestring::ByteString;
 use futures::Stream;
 
-use restate_memory::{LocalMemoryLease, LocalMemoryPool, OutOfMemory, PinnableMemoryStream};
+use restate_memory::{
+    ClaimedMemoryPool, LocalMemoryLease, LocalMemoryPool, OutOfMemory, PinnableMemoryStream,
+};
 use restate_types::deployment::PinnedDeployment;
 use restate_types::identifiers::{EntryIndex, InvocationId, ServiceId};
 use restate_types::invocation::ServiceInvocationSpanContext;
@@ -101,26 +103,13 @@ pub trait InvocationReader {
     type Error: InvocationReaderError;
 
     /// Create a read transaction to read information about invocations from the underlying storage.
-    fn transaction(&mut self) -> Self::Transaction<'_>;
-
-    /// Non-transactional point read of a single journal entry by index.
-    ///
-    /// Used during the bidi-stream phase (after the replay transaction is dropped)
-    /// to read notification/completion data on-demand when a signal-only notification arrives.
-    /// Non-transactional reads are appropriate here because entries are immutable once written.
-    fn read_journal_entry(
-        &mut self,
-        invocation_id: &InvocationId,
-        entry_index: EntryIndex,
-        journal_kind: JournalKind,
-    ) -> impl Future<Output = Result<Option<JournalEntry>, Self::Error>> + Send;
+    fn transaction(&mut self) -> Result<Self::Transaction<'_>, Self::Error>;
 
     /// Budget-gated point read of a single journal entry.
     ///
-    /// Delegates to the storage-api `get_journal_entry_budgeted` trait method
-    /// which peeks the raw byte size from RocksDB, acquires a
-    /// [`LocalMemoryLease`] from `budget` for that size *before* the entry is
-    /// decoded, then decodes and returns the entry together with its lease.
+    /// Peeks the raw byte size from storage, acquires a [`LocalMemoryLease`]
+    /// from `budget` for that size *before* the entry is decoded, then decodes
+    /// and returns the entry together with its lease.
     fn read_journal_entry_budgeted(
         &mut self,
         invocation_id: &InvocationId,
@@ -147,12 +136,6 @@ pub trait InvocationReader {
 ///
 /// Important: Implementations must ensure that all read methods return consistent results.
 pub trait InvocationReaderTransaction {
-    type JournalStream<'a>: Stream<Item = Result<JournalEntry, Self::Error>> + Unpin + Send
-    where
-        Self: 'a;
-    type StateStream<'a>: Stream<Item = Result<(Bytes, Bytes), Self::Error>> + Send
-    where
-        Self: 'a;
     type LocalMemoryPooledJournalStream<'a>: Stream<Item = Result<(JournalEntry, LocalMemoryLease), Self::Error>>
         + Unpin
         + Send
@@ -173,56 +156,40 @@ pub trait InvocationReaderTransaction {
         invocation_id: &InvocationId,
     ) -> impl Future<Output = Result<Option<JournalMetadata>, Self::Error>> + Send;
 
-    /// Read the journal stream for replay.
-    ///
-    /// The returned journal **MUST** not return events.
-    /// This method returns a lazy stream that reads entries on-demand from storage.
-    fn read_journal(
-        &self,
-        invocation_id: &InvocationId,
-        length: EntryIndex,
-        journal_kind: JournalKind,
-    ) -> Result<Self::JournalStream<'_>, Self::Error>;
-
-    /// Read the state for the given service id.
-    /// Returns a stream of state entries that can be collected by the caller.
-    fn read_state(
-        &self,
-        service_id: &ServiceId,
-    ) -> Result<EagerState<Self::StateStream<'_>>, Self::Error>;
-
     /// Budget-gated journal replay stream.
     ///
-    /// Delegates to the storage-api `get_journal_budgeted` trait method which
-    /// peeks each entry's raw byte size from RocksDB, acquires a
+    /// Peeks each entry's raw byte size from storage, acquires a
     /// [`LocalMemoryLease`] from `budget` for that size *before* the entry is
     /// decoded, then decodes and yields the entry together with its lease.
+    ///
+    /// `budget` may be lent to a storage worker until the stream is done or
+    /// dropped: the stream keeps it borrowed, and claiming it again afterwards
+    /// waits for it to come back.
     fn read_journal_budgeted<'a>(
         &'a self,
         invocation_id: &InvocationId,
         length: EntryIndex,
         journal_kind: JournalKind,
-        budget: &'a mut LocalMemoryPool,
+        budget: ClaimedMemoryPool<'a>,
     ) -> Result<Self::LocalMemoryPooledJournalStream<'a>, Self::Error>;
 
     /// Budget-gated state loading stream.
     ///
-    /// Delegates to the storage-api budgeted state reads, acquiring a
-    /// [`LocalMemoryLease`] *before* copying each value. Waits for reclaimable
-    /// memory when feasible and yields a budget error otherwise.
+    /// Acquires a [`LocalMemoryLease`] from `budget` *before* copying each value.
+    /// Waits for reclaimable memory when feasible and yields a budget error
+    /// otherwise.
     ///
-    /// The exclusive borrow allows lazy point-read streams to remain `Send`
-    /// even when the underlying storage transaction is not `Sync`; see
-    /// `ReadStateTable::get_user_states_budgeted` for the storage-side constraint.
+    /// Like [`Self::read_journal_budgeted`], `budget` may be lent to a storage
+    /// worker until the stream is done or dropped.
     fn read_state_budgeted<'a>(
         &'a mut self,
         service_id: &ServiceId,
         eager_state_config: &StatePreloadPolicy,
-        budget: &'a mut LocalMemoryPool,
+        budget: ClaimedMemoryPool<'a>,
     ) -> Result<EagerState<Self::LocalMemoryPooledStateStream<'a>>, Self::Error>;
 }
 
-/// Container for the state returned by [`InvocationReaderTransaction::read_state`].
+/// Container for the state returned by [`InvocationReaderTransaction::read_state_budgeted`].
 /// Contains a stream of state entries and a flag indicating if the state is partial.
 pub struct EagerState<S> {
     stream: S,

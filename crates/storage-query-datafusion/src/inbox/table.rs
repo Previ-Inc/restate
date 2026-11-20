@@ -11,42 +11,47 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use restate_partition_store::{PartitionStore, PartitionStoreManager};
-use restate_storage_api::StorageError;
-use restate_storage_api::inbox_table::{ScanInboxTable, SequenceNumberInboxEntry};
+use datafusion::catalog::TableProvider;
+
+use restate_partition_store::inbox_table::InboxTable;
+use restate_partition_store::keys::selection::KeySelection;
+use restate_partition_store::{PartitionStoreManager, QueryIoExecutor, ReadSnapshot};
+use restate_storage_api::inbox_table::{InboxEntry, SequenceNumberInboxEntry};
+use restate_storage_api::protobuf_types::PartitionStoreProtobufValue;
+use restate_storage_api::scan::ScanOutcome;
 use restate_types::sharding::KeyRange;
 
-use crate::context::{QueryContext, SelectPartitions};
+use crate::context::SelectPartitions;
 use crate::filter::FirstMatchingPartitionKeyExtractor;
 use crate::inbox::row::append_inbox_row;
-use crate::inbox::schema::{SysInboxBuilder, sys_inbox_sort_order};
-use crate::partition_store_scanner::{LocalPartitionsScanner, ScanLocalPartition};
+use crate::inbox::schema::{SysInboxBuilder, SysInboxTable, sys_inbox_sort_order};
+use crate::partition_store_scanner::{LocalPartitionsScanner, Rows, ScanLocalPartition};
 use crate::remote_query_scanner_manager::RemoteScannerManager;
 use crate::table_providers::{PartitionedTableProvider, ScanPartition};
 
-const NAME: &str = "sys_inbox";
+impl SysInboxTable {
+    pub(crate) fn create_provider(
+        partition_selector: impl SelectPartitions,
+        remote_scanner_manager: &RemoteScannerManager,
+    ) -> Arc<dyn TableProvider> {
+        let table = PartitionedTableProvider::new(
+            partition_selector,
+            SysInboxBuilder::schema(),
+            sys_inbox_sort_order(),
+            remote_scanner_manager.create_distributed_scanner::<Self>(),
+            FirstMatchingPartitionKeyExtractor::default()
+                .with_service_key("service_key")
+                .with_invocation_id("id"),
+        );
+        Arc::new(table)
+    }
 
-pub(crate) fn register_self(
-    ctx: &QueryContext,
-    partition_selector: impl SelectPartitions,
-    partition_store_manager: Arc<PartitionStoreManager>,
-    remote_scanner_manager: &RemoteScannerManager,
-) -> datafusion::common::Result<()> {
-    let local_partition_scanner = Arc::new(LocalPartitionsScanner::new(
-        partition_store_manager,
-        InboxScanner,
-    )) as Arc<dyn ScanPartition>;
-
-    let table = PartitionedTableProvider::new(
-        partition_selector,
-        SysInboxBuilder::schema(),
-        sys_inbox_sort_order(),
-        remote_scanner_manager.create_distributed_scanner(NAME, local_partition_scanner),
-        FirstMatchingPartitionKeyExtractor::default()
-            .with_service_key("service_key")
-            .with_invocation_id("id"),
-    );
-    ctx.register_partitioned_table(NAME, Arc::new(table))
+    pub(crate) fn create_local_scanner(
+        partition_store_manager: Arc<PartitionStoreManager>,
+        io_executor: QueryIoExecutor,
+    ) -> impl ScanPartition {
+        LocalPartitionsScanner::<InboxScanner>::new(partition_store_manager, io_executor)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -54,30 +59,31 @@ struct InboxScanner;
 
 impl ScanLocalPartition for InboxScanner {
     type Builder = SysInboxBuilder;
-    type Item<'a> = SequenceNumberInboxEntry;
-    type ConversionError = std::convert::Infallible;
     type Filter = KeyRange;
 
-    fn for_each_row<
-        F: for<'a> FnMut(
-                Self::Item<'a>,
-            ) -> std::ops::ControlFlow<Result<(), Self::ConversionError>>
-            + Send
-            + Sync
-            + 'static,
-    >(
-        partition_store: &PartitionStore,
+    async fn scan(
+        snapshot: &ReadSnapshot,
+        executor: &QueryIoExecutor,
         range: KeyRange,
-        mut f: F,
-    ) -> Result<impl Future<Output = restate_storage_api::Result<()>> + Send, StorageError> {
-        partition_store.for_each_inbox(range, move |item| f(item).map_break(Result::unwrap))
-    }
-
-    fn append_row<'a>(
-        row_builder: &mut Self::Builder,
-        value: Self::Item<'a>,
-    ) -> Result<(), Self::ConversionError> {
-        append_inbox_row(row_builder, value);
-        Ok(())
+        rows: Rows<Self::Builder>,
+    ) -> restate_storage_api::Result<ScanOutcome<Rows<Self::Builder>>> {
+        rows.read::<InboxTable>(
+            snapshot,
+            executor,
+            "df-inbox",
+            Arc::new(KeySelection::all().restrict_scope(range)),
+            |builder, (key, mut value)| {
+                let key = key.decode_all()?;
+                append_inbox_row(
+                    builder,
+                    SequenceNumberInboxEntry::new(
+                        key.sequence_number,
+                        InboxEntry::decode(&mut value)?,
+                    ),
+                );
+                Ok(())
+            },
+        )
+        .await
     }
 }

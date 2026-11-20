@@ -21,6 +21,7 @@ pub mod invoker_storage_reader;
 mod leadership;
 pub mod node;
 mod processor;
+mod query_reads;
 mod rpc;
 pub mod shuffle;
 #[cfg(feature = "expose-internals")]
@@ -30,6 +31,7 @@ mod state_machine;
 pub mod types;
 
 pub use self::node::NodeContext;
+pub(crate) use self::query_reads::QueryReadiness;
 // Re-exported so external drivers (e.g. pp-bench) can build a context to drive `StateMachine::apply`.
 #[cfg(feature = "expose-internals")]
 pub use self::processor::ProcessorRawContext;
@@ -47,6 +49,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, error, instrument, trace, warn};
 
 use restate_bifrost::loglet::FindTailOptions;
+use restate_bifrost::read_stream_registry::ReadStreamTags;
 use restate_bifrost::{DataRecord, DataRecordError, LogEntry};
 use restate_core::network::{
     Incoming, RawSvcRpc, Rpc, ServiceMessage, ServiceStream, TransportConnect, Verdict,
@@ -66,7 +69,7 @@ use restate_tracing::warn_ratelimited;
 use restate_types::cluster::cluster_state::{PartitionProcessorStatus, RunMode};
 use restate_types::epoch::EpochMetadata;
 use restate_types::identifiers::LeaderEpoch;
-use restate_types::logs::{self, Lsn, RecordDecodeError, SequenceNumber};
+use restate_types::logs::{self, Lsn, Record, RecordDecodeError, SequenceNumber};
 use restate_types::net::RpcRequest;
 use restate_types::net::ingest::{
     self, DedupSequenceNrQueryRequest, DedupSequenceNrQueryResponse, ReceivedIngestRequest,
@@ -81,6 +84,7 @@ use restate_types::net::partition_processor::{
     ResumeInvocationRpcRequest,
 };
 use restate_types::partitions::PartitionFeatureChange;
+use restate_types::protobuf::cluster::DetailedRunMode;
 use restate_types::retries::RetryPolicy;
 use restate_types::schema::Schema;
 use restate_types::storage::{
@@ -88,13 +92,15 @@ use restate_types::storage::{
 };
 use restate_types::time::MillisSinceEpoch;
 use restate_types::{GenerationalNodeId, SemanticRestateVersion, Version};
-use restate_util_string::ReString;
+use restate_util_string::{ReString, format_restring};
 use restate_util_time::DurationExt;
 use restate_vqueues::context::HasVQueues;
 use restate_wal_protocol::control::{CurrentReplicaSetConfiguration, NextReplicaSetConfiguration};
 use restate_wal_protocol::v2::CommandScope;
 use restate_wal_protocol::{Envelope, v2};
-use restate_worker_api::{LeaderQueryCommand, LeaderQueryReceiver};
+use restate_worker_api::{
+    LeaderQueryCommand, LeaderQueryReceiver, PartitionReadError, PartitionReadRequest,
+};
 
 use self::leadership::{CommitCallback, FromRpcReply, RpcProposalSender};
 use self::processor::commands::{
@@ -105,7 +111,7 @@ use self::processor::*;
 use self::state_machine::StateMachine;
 use crate::metric_definitions::{
     LEADER_LABEL, LEADER_LABEL_FOLLOWER, LEADER_LABEL_LEADER, PARTITION_APPLY_COMMAND,
-    PARTITION_RECORD_COMMITTED_TO_READ_LATENCY_SECONDS,
+    PARTITION_RECORD_COMMITTED_TO_READ_LATENCY_SECONDS, PARTITION_WRITE_BATCH_SIZE_BYTES,
 };
 use crate::partition::leadership::LeadershipState;
 use crate::partition::processor::leadership::LeadershipContext;
@@ -177,6 +183,7 @@ pub enum TargetLeaderState {
 }
 
 pub(super) struct PartitionProcessorBuilder {
+    query_reads: query_reads::QueryReads,
     target_leader_state_rx: watch::Receiver<TargetLeaderState>,
     network_svc_rx: ServiceStream<PartitionLeaderService>,
     status_watch_tx: watch::Sender<PartitionProcessorStatus>,
@@ -191,8 +198,11 @@ impl PartitionProcessorBuilder {
         status_watch_tx: watch::Sender<PartitionProcessorStatus>,
         commit_fence_rx: mpsc::Receiver<CommitFenceRequest>,
         node_ctx: NodeContext,
+        query_requests: mpsc::Receiver<PartitionReadRequest>,
+        query_ready: watch::Sender<QueryReadiness>,
     ) -> Self {
         Self {
+            query_reads: query_reads::QueryReads::new(query_requests, query_ready),
             target_leader_state_rx,
             network_svc_rx,
             status_watch_tx,
@@ -210,6 +220,7 @@ impl PartitionProcessorBuilder {
         T: TransportConnect,
     {
         let PartitionProcessorBuilder {
+            query_reads,
             target_leader_state_rx,
             network_svc_rx: rpc_rx,
             status_watch_tx,
@@ -254,6 +265,7 @@ impl PartitionProcessorBuilder {
             LeadershipState::new(ctx.partition_id(), ingestion_client, leader_query_tx);
 
         Ok(PartitionProcessor {
+            query_reads,
             partition_store,
             ctx,
             node_ctx,
@@ -264,11 +276,14 @@ impl PartitionProcessorBuilder {
             leader_query_rx,
             commit_fence_rx,
             encoding_arena: BytesMut::new(),
+            read_stream_tags: None,
         })
     }
 }
 
 pub struct PartitionProcessor<T> {
+    /// The query reads waiting for admission between turns.
+    query_reads: query_reads::QueryReads,
     partition_store: PartitionStore,
     ctx: ProcessorRawContext,
     node_ctx: NodeContext,
@@ -279,6 +294,8 @@ pub struct PartitionProcessor<T> {
     leader_query_rx: LeaderQueryReceiver,
     commit_fence_rx: mpsc::Receiver<CommitFenceRequest>,
     encoding_arena: BytesMut,
+    /// Shows the processor's leadership on its read stream in `bifrost_read_streams`.
+    read_stream_tags: Option<ReadStreamTags>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -404,6 +421,10 @@ where
                 Ok(())
             }
         };
+
+        // Admit no more query reads, and cancel the admitted ones. Closing the
+        // partition store then waits for their snapshots to be released.
+        self.query_reads.shutdown().await;
 
         // clean up pending rpcs and stop child tasks
         self.leadership_state.step_down().await;
@@ -548,19 +569,24 @@ where
         // Note: we didn't remove the leader label to avoid breaking existing dashboards. This can
         // be removed in the future if deemed necessary.
         let leader_record_write_to_read_latency = histogram!(PARTITION_RECORD_COMMITTED_TO_READ_LATENCY_SECONDS, LEADER_LABEL => LEADER_LABEL_LEADER);
+        let leader_write_batch_size =
+            histogram!(PARTITION_WRITE_BATCH_SIZE_BYTES, LEADER_LABEL => LEADER_LABEL_LEADER);
+        let follower_write_batch_size =
+            histogram!(PARTITION_WRITE_BATCH_SIZE_BYTES, LEADER_LABEL => LEADER_LABEL_FOLLOWER);
 
         // Start reading after the last applied lsn
-        let mut record_stream = std::pin::pin!(
-            self.node_ctx
-                .bifrost
-                .create_reader(
-                    log_id,
-                    logs::KeyFilter::Within(self.ctx.key_range().into()),
-                    self.ctx.fsm().last_applied_lsn().next(),
-                    Lsn::MAX,
-                )?
-                .peekable()
-        );
+        let reader = self
+            .node_ctx
+            .bifrost
+            .create_reader(
+                log_id,
+                logs::KeyFilter::Within(self.ctx.key_range().into()),
+                self.ctx.fsm().last_applied_lsn().next(),
+                Lsn::MAX,
+            )?
+            .with_name(format_restring!("pp-{partition_id}"));
+        self.read_stream_tags = Some(reader.tags());
+        let mut record_stream = std::pin::pin!(reader.peekable());
 
         // avoid synchronized timers.
         let mut status_update_timer =
@@ -575,8 +601,14 @@ where
             .watch_leadership_state(partition_id);
         watch_leader_changes.mark_changed();
 
+        // Backfills of indexes and statistics run between the arms below, through
+        // `txn`, which has no pending writes there.
+        let mut walks = self
+            .partition_store
+            .walk_driver(&self.node_ctx.config.live_load().worker.storage);
         let mut cloned_partition_store = self.partition_store.clone();
         let mut txn = cloned_partition_store.transaction();
+        txn.set_fsm_position(self.ctx.fsm_position());
         let partition_id = self.ctx.partition_id().into();
 
         // Migrations and local storage features have been enabled prior to this point.
@@ -587,6 +619,8 @@ where
             old.updated_at = MillisSinceEpoch::now();
         });
 
+        self.query_reads.mark_ready();
+
         loop {
             let config = self.node_ctx.config.live_load();
             let max_batching_size = config.worker.max_command_batch_size();
@@ -594,6 +628,23 @@ where
             let rpc_proposal_sender = self.leadership_state.rpc_proposal_sender();
 
             tokio::select! {
+                // A query read, admitted between committed turns: the storage snapshot
+                // and the processor's own live state come from the same point.
+                Some(request) = self.query_reads.next() => {
+                    let _guard = SlowPartitionProcessorArmTracker::new(partition_id, "query_reads");
+                    walks.note_foreground();
+                    let leader_hint = self.ctx.status().last_observed_leader_node()
+                        .filter(|node| node.is_valid() && *node != self.node_ctx.my_node_id());
+                    let partition = request.partition;
+                    let leadership = &self.leadership_state;
+                    let vqueues = self.ctx.vqueues();
+                    // The processor captures only what it owns; the manager's handle
+                    // reads the invoker's rows after admission.
+                    self.query_reads.admit(&self.partition_store, leadership.query_leading(), leader_hint, request, |requested| {
+                        leadership.capture_query_state(vqueues, requested)
+                            .ok_or(PartitionReadError::NotLeader { partition, leader: leader_hint })
+                    });
+                }
                 _ = self.target_leader_state_rx.changed() => {
                     let _guard = SlowPartitionProcessorArmTracker::new(
                         partition_id,
@@ -618,6 +669,7 @@ where
                         partition_id,
                         "network_leader_svc_rx",
                     );
+                    walks.note_foreground();
                     // todo: replace the live schema with the leader's consistent schema
                     self.on_rpc(msg, live_schemas.live_load(), &last_applied_lsn_watch, rpc_proposal_sender.expect("guarded with is_some")).await;
                 }
@@ -642,21 +694,47 @@ where
                         return Err(ProcessorError::LogReadStreamTerminated);
                     };
                     let first = first?;
+                    walks.note_foreground();
 
                     txn.clear();
+                    txn.set_write_batch_size_histogram(if self.leadership_state.is_leader() {
+                        &leader_write_batch_size
+                    } else {
+                        &follower_write_batch_size
+                    });
                     // clear buffers used when applying the next record
                     action_collector.clear();
 
                     // Apply the batch one record at a time, seeded with the record we just awaited.
                     // The first record is always applied, which guarantees forward progress even
-                    // when a single record is larger than `bytes_limit`. Further records are pulled
-                    // only while immediately available and within the record-count and byte limits.
-                    let mut accumulated_bytes = 0;
+                    // when a single record writes more than `bytes_limit`. Further records are
+                    // pulled only while immediately available, within the record-count limit, and
+                    // while the write batch stays within `bytes_limit` after adding the next
+                    // record's own size, as most commands write at least their payload.
                     let mut count = 0usize;
                     let mut next_entry = Some(first);
                     while let Some(entry) = next_entry.take() {
-                        accumulated_bytes += entry.estimated_memory_size();
                         count += 1;
+                        // The log byte offset counts every record that reaches the processor,
+                        // also the ones it skips as duplicates, so that it only depends on the log.
+                        let record_bytes = match entry.as_record().map(Record::encoded_body_size) {
+                            Some(Some(size)) => size as u64,
+                            Some(None) => {
+                                // Appenders encode every record before appending it, so every
+                                // replica knows its size, also when it reads the record from its
+                                // node's record cache. One without would count differently.
+                                debug_assert!(false, "a record read from the log has no size");
+                                warn_ratelimited!(
+                                    10,
+                                    Duration::from_mins(1),
+                                    partition_id = u32::from(self.ctx.partition_id()),
+                                    "A record read from the log has no known size; the log byte \
+                                     offset doesn't count it",
+                                );
+                                0
+                            }
+                            None => 0,
+                        };
                         match self.apply_log_entry(
                             entry,
                             &mut txn,
@@ -666,14 +744,14 @@ where
                         .await? {
                             NextStep::AdvanceLastAppliedLsn { lsn, ref dedup, scope } => {
                                 self.ctx.dedup_mut().store_dedup_information(&mut txn, dedup)?;
-                                self.ctx.update_last_applied_lsn(&mut txn, lsn)?;
+                                self.ctx.update_last_applied_lsn(&mut txn, lsn, record_bytes)?;
                                 if matches!(scope, CommandScope::PartitionScoped) {
                                     // Update the status to ensure changes are observable
                                     self.refresh_status(&mut durable_lsn_watch)?;
                                 }
                             },
                             NextStep::SkipUntil(lsn) => {
-                                self.ctx.update_last_applied_lsn(&mut txn, lsn)?;
+                                self.ctx.update_last_applied_lsn(&mut txn, lsn, record_bytes)?;
                             }
                         }
 
@@ -689,7 +767,7 @@ where
                             // batch. Termination/errors resurface on the next `next().await`.
                             _ => break,
                         };
-                        if accumulated_bytes + next_size > bytes_limit {
+                        if txn.estimated_size_in_bytes() + next_size > bytes_limit {
                             // Leave the peeked record in the slot; it leads the next batch.
                             break;
                         }
@@ -706,6 +784,7 @@ where
 
                     // Commit our changes and notify actuators about actions if we are the leader
                     txn.commit().await?;
+                    self.ctx.refresh_fsm_position(&txn);
                     self.ctx.release_applied_lsn();
                     self.leadership_state.handle_actions(&mut self.ctx, action_collector.drain(..))?;
 
@@ -732,7 +811,38 @@ where
                         partition_id,
                         "leader_query_rx",
                     );
+                    walks.note_foreground();
                     self.on_leader_query(leader_query_cmd);
+                }
+                // A slice of a backfill, paced to leave most of the time to the other arms: the
+                // record, RPC and query arms count as load, the timers do not. It stages at most
+                // `bytes_limit`, the command batches' write budget, apart from its first entry. It
+                // commits through `txn` and installs what it committed in `txn`, so the next
+                // command batch maintains the indexes it changed. A failed commit stops the
+                // processor, like a failed command batch.
+                () = walks.ready() => {
+                    let _guard = SlowPartitionProcessorArmTracker::new(
+                        partition_id,
+                        "background_walks",
+                    );
+                    // Work waiting for the record, RPC and query arms counts as load, like
+                    // handled work. None of these checks takes anything: the peeked record
+                    // stays buffered for the record arm, and RPCs only count while their arm
+                    // is enabled.
+                    let waiting = record_stream.as_mut().peek().now_or_never().is_some_and(|next| next.is_some())
+                        || (rpc_proposal_sender.is_some() && !self.network_leader_svc_rx.is_empty())
+                        || !self.leader_query_rx.is_empty()
+                        || self.query_reads.has_pending();
+                    if waiting {
+                        walks.note_foreground();
+                    }
+                    // A slice is sized by the walk's budget, not by command batching: keep
+                    // it out of the command batch histogram. The record arm sets the
+                    // histogram again before its next batch.
+                    txn.clear_write_batch_size_histogram();
+                    walks.step(&mut txn, bytes_limit).await?;
+                    // A committed slice or failure record advanced the store byte offset.
+                    self.ctx.refresh_fsm_position(&txn);
                 }
                 // Everything applied so far is committed, so a snapshot exported until the fence
                 // is dropped holds exactly what it reads from the store.
@@ -843,6 +953,11 @@ where
             old.detailed_effective_mode = self.leadership_state.detailed_effective_mode();
             old.updated_at = MillisSinceEpoch::now();
         });
+        if let Some(read_stream_tags) = &self.read_stream_tags {
+            read_stream_tags.set_role(read_stream_role(
+                self.leadership_state.detailed_effective_mode(),
+            ));
+        }
 
         Ok(())
     }
@@ -1254,4 +1369,15 @@ where
         .record(start.elapsed());
         res
     }
+}
+
+/// The role a partition processor shows on its read stream: its leadership, as in its status.
+fn read_stream_role(mode: DetailedRunMode) -> ReString {
+    ReString::from_static(match mode {
+        DetailedRunMode::Leader => "leader",
+        DetailedRunMode::BecomingLeader => "becoming-leader",
+        DetailedRunMode::Candidate => "candidate",
+        DetailedRunMode::Follower => "follower",
+        DetailedRunMode::Unknown => "unknown",
+    })
 }
