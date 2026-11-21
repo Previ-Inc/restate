@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use datafusion::catalog::TableProvider;
 use datafusion::common::TableReference;
+use datafusion::logical_expr::ScalarUDF;
 
 use restate_storage_query_api::{QueryEngineTable, SessionOptions};
 use restate_util_string::ReString;
@@ -55,6 +56,11 @@ impl<'a> TableInventoryBuilder<'a> {
         provider: Arc<dyn TableProvider>,
     ) -> Result<(), BuildError> {
         self.env.register_table::<T>(schema, name, provider)?;
+        Ok(())
+    }
+
+    pub fn add_udf(&mut self, udf: ScalarUDF) -> Result<(), BuildError> {
+        self.env.register_udf(udf)?;
         Ok(())
     }
 

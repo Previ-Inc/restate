@@ -14,6 +14,7 @@ use restate_core::Metadata;
 use restate_limiter::rule_book::RuleBookObserver;
 use restate_metadata_store::MetadataStoreClient;
 use restate_partition_store::{PartitionStoreManager, QueryIoExecutor};
+use restate_storage_query_datafusion::proto_schema::DynamicProtoSchemaRegistry;
 use restate_types::live::Live;
 use restate_types::schema::deployment::DeploymentResolver;
 use restate_types::schema::service::ServiceMetadataResolver;
@@ -30,6 +31,7 @@ use crate::tables::locks::SysLocksTable;
 use crate::tables::migration_records::{MigrationJobsTable, RegistryTable};
 use crate::tables::partition_state::{PartitionStateReports, PartitionStateTable};
 use crate::tables::promise::SysPromiseTable;
+use crate::tables::proto_schemas::schema::SysProtoSchemasTable;
 use crate::tables::rules::schema::SysRulesTable;
 use crate::tables::scheduler_status::schema::SysSchedulerTable;
 use crate::tables::service::schema::SysServiceTable;
@@ -71,11 +73,34 @@ pub fn register_metadata_scanners(
     rule_book_observer: Option<Arc<dyn RuleBookObserver>>,
     sources: &SourceRegistry,
 ) {
+    let proto_registry = DynamicProtoSchemaRegistry::new(schemas.clone());
+    register_metadata_scanners_with_proto_registry(
+        schemas,
+        proto_registry,
+        metadata_store_client,
+        rule_book_observer,
+        sources,
+    );
+}
+
+/// Like [`register_metadata_scanners`], reusing a shared [`DynamicProtoSchemaRegistry`].
+pub fn register_metadata_scanners_with_proto_registry<S>(
+    schemas: Live<S>,
+    proto_registry: DynamicProtoSchemaRegistry<S>,
+    metadata_store_client: MetadataStoreClient,
+    rule_book_observer: Option<Arc<dyn RuleBookObserver>>,
+    sources: &SourceRegistry,
+) where
+    S: DeploymentResolver + ServiceMetadataResolver + Clone + Send + Sync + 'static,
+{
     sources.register_node_scanner::<SysServiceTable>(Arc::new(
         SysServiceTable::create_local_scanner(schemas.clone()),
     ));
     sources.register_node_scanner::<SysDeploymentTable>(Arc::new(
         SysDeploymentTable::create_local_scanner(schemas),
+    ));
+    sources.register_node_scanner::<SysProtoSchemasTable>(Arc::new(
+        SysProtoSchemasTable::create_local_scanner(proto_registry),
     ));
     sources.register_node_scanner::<SysRulesTable>(Arc::new(SysRulesTable::create_local_scanner(
         metadata_store_client,

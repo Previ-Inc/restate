@@ -153,7 +153,12 @@ async fn offline_query_access_preserves_persisted_rows_without_live_state() {
         key.entry_id().display(qid.partition_key()).to_string()
     );
 
-    for table in ["sys_service", "sys_deployment", "sys_rules"] {
+    for table in [
+        "sys_service",
+        "sys_deployment",
+        "sys_rules",
+        "sys_proto_schemas",
+    ] {
         let QueryExecutionError::DataFusion(error) = engine
             .execute(format!("SELECT * FROM {table}"))
             .await
@@ -165,12 +170,28 @@ async fn offline_query_access_preserves_persisted_rows_without_live_state() {
             "{error}"
         );
     }
+
+    let QueryExecutionError::DataFusion(error) = engine
+        .execute("SELECT proto_to_json(service_name, key, value) FROM state")
+        .await
+        .err()
+        .expect("proto UDFs must be absent offline");
+    assert!(
+        matches!(error.find_root(), DataFusionError::Plan(message)
+            if message.contains("proto_to_json")),
+        "{error}"
+    );
 }
 
 #[restate_core::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metadata_backed_tables_are_available_when_supplied() {
     let engine = MockQueryEngine::create().await;
-    for table in ["sys_service", "sys_deployment", "sys_rules"] {
+    for table in [
+        "sys_service",
+        "sys_deployment",
+        "sys_rules",
+        "sys_proto_schemas",
+    ] {
         let batches: Vec<_> = engine
             .execute(format!("SELECT * FROM {table}"))
             .await

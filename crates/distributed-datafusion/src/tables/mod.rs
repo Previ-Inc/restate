@@ -45,6 +45,7 @@ pub(crate) mod partition_replica_set;
 pub(crate) mod partition_state;
 pub(crate) mod partitions;
 pub(crate) mod promise;
+pub(crate) mod proto_schemas;
 pub(crate) mod rules;
 pub(crate) mod scheduler_status;
 pub(crate) mod service;

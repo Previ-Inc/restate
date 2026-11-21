@@ -62,7 +62,8 @@ impl RemoteQueryScannerServer {
             network_rx,
         } = self;
 
-        let expression_context = env.build_session_state()?.task_ctx();
+        let mut cached_udf_gen = env.udf_generation();
+        let mut expression_context = env.build_session_state()?.task_ctx();
         let mut shutdown = pin::pin!(cancellation_watcher());
         let mut next_scanner_id = 1u64;
         let scanners: Arc<ScannerMap> = Default::default();
@@ -79,6 +80,24 @@ impl RemoteQueryScannerServer {
                     match msg {
                         ServiceMessage::Rpc(msg) if msg.msg_type() == RemoteQueryScannerOpen::TYPE => {
                             let scan_req = msg.into_typed::<RemoteQueryScannerOpen>();
+                            let current_gen = env.udf_generation();
+                            if current_gen != cached_udf_gen {
+                                match env.build_session_state() {
+                                    Ok(state) => {
+                                        expression_context = state.task_ctx();
+                                        cached_udf_gen = current_gen;
+                                    }
+                                    Err(e) => {
+                                        let (reciprocal, body) = scan_req.split();
+                                        warn!(
+                                            "Unable to rebuild expression context for scanner in partition {}: {e}",
+                                            body.partition_id
+                                        );
+                                        reciprocal.send(RemoteQueryScannerOpened::Failure);
+                                        continue;
+                                    }
+                                }
+                            }
                             Self::on_open(&mut next_scanner_id, &expression_context, scan_req, &scanners, &remote_scanner_manager);
                         }
                         ServiceMessage::Rpc(msg) if msg.msg_type() == RemoteQueryScannerNext::TYPE => {

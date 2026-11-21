@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::{DashMap, mapref::entry::Entry};
 use datafusion::catalog::{MemoryCatalogProvider, MemorySchemaProvider, TableProvider};
@@ -18,7 +19,10 @@ use datafusion::common::TableReference;
 use datafusion::error::DataFusionError;
 use datafusion::execution::config::SessionConfig;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
-use datafusion::execution::{SessionState, SessionStateBuilder, SessionStateDefaults};
+use datafusion::execution::{
+    FunctionRegistry, SessionState, SessionStateBuilder, SessionStateDefaults,
+};
+use datafusion::logical_expr::ScalarUDF;
 use datafusion::logical_expr::registry::{ExtensionTypeRegistry, MemoryExtensionTypeRegistry};
 use datafusion::prelude::SessionContext;
 
@@ -73,6 +77,8 @@ pub struct DataFusionEnv {
     io_executor: QueryIoExecutor,
     config: SessionConfig,
     tables: Arc<DashMap<ReString, RegisteredTable>>,
+    udfs: Arc<DashMap<ReString, Arc<ScalarUDF>>>,
+    udf_generation: Arc<AtomicU64>,
 }
 
 impl DataFusionEnv {
@@ -152,6 +158,8 @@ impl DataFusionEnv {
             ),
             config,
             tables: Arc::new(DashMap::new()),
+            udfs: Arc::new(DashMap::new()),
+            udf_generation: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -223,6 +231,29 @@ impl DataFusionEnv {
                 entry.key()
             ))),
         }
+    }
+
+    /// Registers a scalar UDF on the shared environment so every session and remote scanner sees it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a UDF with the same name is already registered.
+    pub fn register_udf(&self, udf: ScalarUDF) -> Result<(), DataFusionError> {
+        match self.udfs.entry(ReString::from(udf.name())) {
+            Entry::Vacant(entry) => {
+                entry.insert(Arc::new(udf));
+                self.udf_generation.fetch_add(1, Ordering::Release);
+                Ok(())
+            }
+            Entry::Occupied(entry) => Err(DataFusionError::Plan(format!(
+                "duplicate query UDF '{}'",
+                entry.key()
+            ))),
+        }
+    }
+
+    pub(crate) fn udf_generation(&self) -> u64 {
+        self.udf_generation.load(Ordering::Acquire)
     }
 
     /// Clones a provider without retaining a DashMap guard across planning or execution.
@@ -310,6 +341,9 @@ impl DataFusionEnv {
             .with_runtime_env(Arc::clone(&self.runtime));
         let mut state = apply_default_features(builder).build();
         datafusion_functions_json::register_all(&mut state)?;
+        for entry in self.udfs.iter() {
+            state.register_udf(Arc::clone(entry.value()))?;
+        }
         Ok(state)
     }
 }

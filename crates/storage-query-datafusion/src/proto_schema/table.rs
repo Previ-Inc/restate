@@ -1,0 +1,158 @@
+// Copyright (c) 2023 - 2026 Restate Software, Inc., Restate GmbH.
+// All rights reserved.
+//
+// Use of this software is governed by the Business Source License
+// included in the LICENSE file.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0.
+
+//! Introspection table `sys_proto_schemas` listing all dynamically registered Protobuf
+//! state schemas across services.
+
+use std::sync::Arc;
+
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::catalog::TableProvider;
+use datafusion::logical_expr::Expr;
+use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::{RecordBatchReceiverStream, RecordBatchStreamAdapter};
+use futures::stream;
+
+use restate_types::schema::service::ServiceMetadataResolver;
+
+use super::DynamicProtoSchemaRegistry;
+use crate::statistics::{SERVICE_ROW_ESTIMATE, TableStatisticsBuilder};
+use crate::table_macro::*;
+use crate::table_providers::{GenericTableProvider, Scan};
+use crate::table_util::Builder;
+
+define_table!(
+    /// Dynamically registered Protobuf schemas for Virtual Object and Workflow state.
+    ///
+    /// Populated automatically from service discovery metadata (`proto.descriptor_set`
+    /// and `proto.state.<key>`).
+    sys_proto_schemas(
+    /// The name of the registered user service.
+    service_name: DataType::LargeUtf8,
+
+    /// The revision of the service that registered this schema.
+    revision: DataType::UInt64,
+
+    /// The state key mapped to this Protobuf message (or `*` for wildcard default).
+    state_key: DataType::LargeUtf8,
+
+    /// Fully qualified Protobuf message name (e.g. `acme.v1.UserProfile`).
+    message_name: DataType::LargeUtf8,
+
+    /// JSON array describing all fields (`name`, `number`, `type`, `repeated`, `map`) of the message.
+    fields_json: DataType::LargeUtf8,
+));
+
+impl SysProtoSchemasTable {
+    pub(crate) fn create_provider<SMR: ServiceMetadataResolver + Send + Sync + Clone + 'static>(
+        registry: DynamicProtoSchemaRegistry<SMR>,
+    ) -> Arc<dyn TableProvider> {
+        let schema = SysProtoSchemasBuilder::schema();
+        let statistics = TableStatisticsBuilder::new(schema)
+            .with_num_rows_estimate(SERVICE_ROW_ESTIMATE)
+            .with_foreign_key("service_name", SERVICE_ROW_ESTIMATE);
+        let table = GenericTableProvider::new(
+            SysProtoSchemasBuilder::schema(),
+            Arc::new(ProtoSchemasScanner(registry)),
+        )
+        .with_statistics(statistics.build());
+
+        Arc::new(table)
+    }
+}
+
+#[derive(Clone, derive_more::Debug)]
+#[debug("ProtoSchemasScanner")]
+struct ProtoSchemasScanner<SMR>(DynamicProtoSchemaRegistry<SMR>);
+
+#[inline]
+fn append_proto_schema_row(
+    builder: &mut SysProtoSchemasBuilder,
+    service_name: &str,
+    revision: u32,
+    state_key: &str,
+    msg: &super::CompiledMessageSchema,
+) {
+    let mut row = builder.row();
+    row.service_name(service_name);
+    row.revision(u64::from(revision));
+    row.state_key(state_key);
+    row.message_name(&msg.full_name);
+    if row.is_fields_json_defined() {
+        row.fields_json(msg.fields_summary_json());
+    }
+}
+
+impl<SMR: ServiceMetadataResolver + Sync + Send + Clone + 'static> Scan
+    for ProtoSchemasScanner<SMR>
+{
+    fn scan(
+        &self,
+        projection: SchemaRef,
+        _filters: &[Expr],
+        batch_size: usize,
+        limit: Option<usize>,
+    ) -> SendableRecordBatchStream {
+        if limit == Some(0) {
+            return Box::pin(RecordBatchStreamAdapter::new(projection, stream::empty()));
+        }
+
+        let schema = projection.clone();
+        let mut stream_builder = RecordBatchReceiverStream::builder(projection, 16);
+        let tx = stream_builder.tx();
+        let registry = self.0.clone();
+
+        stream_builder.spawn(async move {
+            let services = registry.list_all_service_schemas();
+            let mut builder = SysProtoSchemasBuilder::new(schema);
+            let mut emitted: usize = 0;
+            'outer: for svc in services {
+                if limit.is_some_and(|l| emitted >= l) {
+                    break;
+                }
+                let mut keys: Vec<(&str, &Arc<super::CompiledMessageSchema>)> = svc
+                    .state_key_messages
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v))
+                    .collect();
+                keys.sort_by_key(|(k, _)| *k);
+                if let Some(wild) = &svc.wildcard_message {
+                    keys.push(("*", wild));
+                }
+                for (state_key, msg) in keys {
+                    if limit.is_some_and(|l| emitted >= l) {
+                        break 'outer;
+                    }
+                    append_proto_schema_row(
+                        &mut builder,
+                        &svc.service_name,
+                        svc.revision,
+                        state_key,
+                        msg,
+                    );
+                    emitted += 1;
+                    if builder.num_rows() >= batch_size {
+                        let batch: datafusion::common::Result<RecordBatch> =
+                            builder.finish_and_new();
+                        if tx.send(batch).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            if !builder.empty() {
+                let _ = tx.send(builder.finish()).await;
+            }
+            Ok(())
+        });
+        stream_builder.build()
+    }
+}

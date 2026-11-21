@@ -51,7 +51,8 @@ use crate::catalog::RegisterTable;
 use crate::context::SelectPartitions;
 use crate::distributed::DistributedQueryServer;
 use crate::local_scanners::{
-    register_live_scanners, register_metadata_scanners, register_partition_scanners,
+    register_live_scanners, register_metadata_scanners_with_proto_registry,
+    register_partition_scanners,
 };
 use crate::source_registry::{PartitionLocation, PartitionLocator, SourceRegistry};
 use crate::{DataFusionEnv, UserTables};
@@ -261,8 +262,14 @@ impl MockQueryEngine {
         );
         register_partition_scanners(Arc::clone(&manager), crate::mocks::query_io(), &sources);
         register_live_scanners(&sources);
-        register_metadata_scanners(
-            Live::from_value(schemas),
+        let schemas = Live::from_value(schemas);
+        let proto_registry = v1::proto_schema::DynamicProtoSchemaRegistry::new(schemas.clone());
+        for udf in v1::proto_schema::udf::create_udfs(proto_registry.clone()) {
+            env.register_udf(udf).unwrap();
+        }
+        register_metadata_scanners_with_proto_registry(
+            schemas,
+            proto_registry,
             MetadataStoreClient::new_in_memory(),
             None,
             &sources,
