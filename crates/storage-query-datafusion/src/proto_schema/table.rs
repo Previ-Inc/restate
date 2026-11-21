@@ -18,7 +18,9 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::TableProvider;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::SendableRecordBatchStream;
-use datafusion::physical_plan::stream::RecordBatchReceiverStream;
+use datafusion::physical_plan::stream::{RecordBatchReceiverStream, RecordBatchStreamAdapter};
+use futures::stream;
+
 use restate_types::schema::service::ServiceMetadataResolver;
 
 use super::DynamicProtoSchemaRegistry;
@@ -42,7 +44,7 @@ define_table!(
     /// The state key mapped to this Protobuf message (or `*` for wildcard default).
     state_key: DataType::LargeUtf8,
 
-    /// Fully qualified Protobuf message name (e.g. `previ.bench.BusyMemberProfile`).
+    /// Fully qualified Protobuf message name (e.g. `acme.v1.UserProfile`).
     message_name: DataType::LargeUtf8,
 
     /// JSON array describing all fields (`name`, `number`, `type`, `repeated`, `map`) of the message.
@@ -54,8 +56,9 @@ impl SysProtoSchemasTable {
         registry: DynamicProtoSchemaRegistry<SMR>,
     ) -> Arc<dyn TableProvider> {
         let schema = SysProtoSchemasBuilder::schema();
-        let statistics =
-            TableStatisticsBuilder::new(schema).with_num_rows_estimate(SERVICE_ROW_ESTIMATE);
+        let statistics = TableStatisticsBuilder::new(schema)
+            .with_num_rows_estimate(SERVICE_ROW_ESTIMATE)
+            .with_foreign_key("service_name", SERVICE_ROW_ESTIMATE);
         let table = GenericTableProvider::new(
             SysProtoSchemasBuilder::schema(),
             Arc::new(ProtoSchemasScanner(registry)),
@@ -96,8 +99,12 @@ impl<SMR: ServiceMetadataResolver + Sync + Send + Clone + 'static> Scan
         projection: SchemaRef,
         _filters: &[Expr],
         batch_size: usize,
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> SendableRecordBatchStream {
+        if limit == Some(0) {
+            return Box::pin(RecordBatchStreamAdapter::new(projection, stream::empty()));
+        }
+
         let schema = projection.clone();
         let mut stream_builder = RecordBatchReceiverStream::builder(projection, 16);
         let tx = stream_builder.tx();
@@ -106,7 +113,11 @@ impl<SMR: ServiceMetadataResolver + Sync + Send + Clone + 'static> Scan
         stream_builder.spawn(async move {
             let services = registry.list_all_service_schemas();
             let mut builder = SysProtoSchemasBuilder::new(schema);
-            for svc in services {
+            let mut emitted: usize = 0;
+            'outer: for svc in services {
+                if limit.is_some_and(|l| emitted >= l) {
+                    break;
+                }
                 let mut keys: Vec<(&str, &Arc<super::CompiledMessageSchema>)> = svc
                     .state_key_messages
                     .iter()
@@ -117,6 +128,9 @@ impl<SMR: ServiceMetadataResolver + Sync + Send + Clone + 'static> Scan
                     keys.push(("*", wild));
                 }
                 for (state_key, msg) in keys {
+                    if limit.is_some_and(|l| emitted >= l) {
+                        break 'outer;
+                    }
                     append_proto_schema_row(
                         &mut builder,
                         &svc.service_name,
@@ -124,6 +138,7 @@ impl<SMR: ServiceMetadataResolver + Sync + Send + Clone + 'static> Scan
                         state_key,
                         msg,
                     );
+                    emitted += 1;
                     if builder.num_rows() >= batch_size {
                         let batch: datafusion::common::Result<RecordBatch> =
                             builder.finish_and_new();

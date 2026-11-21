@@ -35,6 +35,7 @@ pub mod partition_replica_set;
 pub mod partition_state;
 pub mod partitions;
 pub mod promise;
+pub mod proto_schemas;
 pub mod registry;
 pub mod rules;
 pub mod scheduler;

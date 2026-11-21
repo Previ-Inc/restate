@@ -1236,6 +1236,10 @@ impl ServiceMetadataResolver for Schema {
             .map(|revision| revision.service_revision.name.clone())
             .collect()
     }
+
+    fn is_immutable_snapshot(&self) -> bool {
+        true
+    }
 }
 
 impl SubscriptionResolver for Schema {

@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::{DashMap, mapref::entry::Entry};
 use datafusion::catalog::{MemoryCatalogProvider, MemorySchemaProvider, TableProvider};
@@ -24,6 +25,7 @@ use datafusion::execution::{
 use datafusion::logical_expr::ScalarUDF;
 use datafusion::logical_expr::registry::{ExtensionTypeRegistry, MemoryExtensionTypeRegistry};
 use datafusion::prelude::SessionContext;
+
 use restate_clock::{AtomicStorage, HlcClock, UniqueTimestamp, WallClock};
 use restate_partition_store::QueryIoExecutor;
 use restate_storage_query_api::{QueryEngineTable, SessionOptions};
@@ -76,6 +78,7 @@ pub struct DataFusionEnv {
     config: SessionConfig,
     tables: Arc<DashMap<ReString, RegisteredTable>>,
     udfs: Arc<DashMap<ReString, Arc<ScalarUDF>>>,
+    udf_generation: Arc<AtomicU64>,
 }
 
 impl DataFusionEnv {
@@ -156,6 +159,7 @@ impl DataFusionEnv {
             config,
             tables: Arc::new(DashMap::new()),
             udfs: Arc::new(DashMap::new()),
+            udf_generation: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -230,8 +234,26 @@ impl DataFusionEnv {
     }
 
     /// Registers a scalar UDF on the shared environment so every session and remote scanner sees it.
-    pub fn register_udf(&self, udf: ScalarUDF) {
-        self.udfs.insert(ReString::from(udf.name()), Arc::new(udf));
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a UDF with the same name is already registered.
+    pub fn register_udf(&self, udf: ScalarUDF) -> Result<(), DataFusionError> {
+        match self.udfs.entry(ReString::from(udf.name())) {
+            Entry::Vacant(entry) => {
+                entry.insert(Arc::new(udf));
+                self.udf_generation.fetch_add(1, Ordering::Release);
+                Ok(())
+            }
+            Entry::Occupied(entry) => Err(DataFusionError::Plan(format!(
+                "duplicate query UDF '{}'",
+                entry.key()
+            ))),
+        }
+    }
+
+    pub(crate) fn udf_generation(&self) -> u64 {
+        self.udf_generation.load(Ordering::Acquire)
     }
 
     /// Clones a provider without retaining a DashMap guard across planning or execution.

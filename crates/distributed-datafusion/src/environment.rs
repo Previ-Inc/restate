@@ -19,7 +19,10 @@ use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::error::DataFusionError;
 use datafusion::execution::config::SessionConfig;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
-use datafusion::execution::{SessionState, SessionStateBuilder, SessionStateDefaults};
+use datafusion::execution::{
+    FunctionRegistry, SessionState, SessionStateBuilder, SessionStateDefaults,
+};
+use datafusion::logical_expr::ScalarUDF;
 use datafusion::logical_expr::registry::{ExtensionTypeRegistry, MemoryExtensionTypeRegistry};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
@@ -75,6 +78,7 @@ pub struct DataFusionEnv {
     query_clock: Arc<QueryClock>,
     config: SessionConfig,
     tables: Arc<DashMap<ReString, RegisteredTable>>,
+    udfs: Arc<DashMap<ReString, Arc<ScalarUDF>>>,
 }
 
 impl DataFusionEnv {
@@ -181,6 +185,7 @@ impl DataFusionEnv {
             )),
             config,
             tables: Arc::new(DashMap::new()),
+            udfs: Arc::new(DashMap::new()),
         })
     }
 
@@ -236,6 +241,24 @@ impl DataFusionEnv {
             }
             Entry::Occupied(entry) => Err(DataFusionError::Plan(format!(
                 "duplicate query table identity '{}'",
+                entry.key()
+            ))),
+        }
+    }
+
+    /// Registers a scalar UDF on the shared environment so every session and remote worker sees it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a UDF with the same name is already registered.
+    pub fn register_udf(&self, udf: ScalarUDF) -> Result<(), DataFusionError> {
+        match self.udfs.entry(ReString::from(udf.name())) {
+            Entry::Vacant(entry) => {
+                entry.insert(Arc::new(udf));
+                Ok(())
+            }
+            Entry::Occupied(entry) => Err(DataFusionError::Plan(format!(
+                "duplicate query UDF '{}'",
                 entry.key()
             ))),
         }
@@ -344,6 +367,9 @@ impl DataFusionEnv {
         };
         let mut state = apply_default_features(builder).build();
         datafusion_functions_json::register_all(&mut state)?;
+        for entry in self.udfs.iter() {
+            state.register_udf(Arc::clone(entry.value()))?;
+        }
         Ok(state)
     }
 
@@ -354,6 +380,9 @@ impl DataFusionEnv {
         let mut state =
             apply_default_features(builder.with_runtime_env(Arc::clone(&self.runtime))).build();
         datafusion_functions_json::register_all(&mut state)?;
+        for entry in self.udfs.iter() {
+            state.register_udf(Arc::clone(entry.value()))?;
+        }
         Ok(state)
     }
 }

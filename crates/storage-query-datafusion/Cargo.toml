@@ -34,9 +34,9 @@ restate-worker-api = { workspace = true, features = ["serde"] }
 ahash = { workspace = true }                                                    # Required to due a yanked version used by datafusion
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+base64 = { workspace = true }
 bilrost = { workspace = true }
 bytes = { workspace = true }
-base64 = { workspace = true }
 bytestring = { workspace = true }
 codederror = { workspace = true }
 dashmap = { workspace = true }
@@ -48,6 +48,7 @@ enumset = { workspace = true }
 futures = { workspace = true }
 gardal = { workspace = true }
 itertools = { workspace = true }
+moka = { workspace = true, features = ["sync"] }
 parking_lot = { workspace = true }
 paste = { workspace = true }
 prost = { workspace = true }

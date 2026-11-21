@@ -9079,6 +9079,7 @@ dependencies = [
  "gardal",
  "googletest",
  "itertools 0.15.0",
+ "moka",
  "parking_lot",
  "paste",
  "prost",

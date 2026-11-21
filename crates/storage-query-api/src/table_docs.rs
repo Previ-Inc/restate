@@ -28,7 +28,7 @@ use crate::LogicalSchema;
 use crate::schema::rows::TableColumn;
 use crate::tables::{
     deployment, invocation_state, invocation_status, journal, journal_events, locks, promise,
-    rules, scheduler, service, state, user_limits, vqueue_entry_status, vqueue_meta,
+    proto_schemas, rules, scheduler, service, state, user_limits, vqueue_entry_status, vqueue_meta,
 };
 
 /// The documentation of one table: its name, its description and its columns.
@@ -84,6 +84,7 @@ pub fn all_table_docs() -> Vec<TableDocs> {
         docs!(journal_events::JournalEvents),
         docs!(locks::Locks),
         docs!(promise::Promise),
+        docs!(proto_schemas::ProtoSchemas),
         docs!(rules::Rules),
         docs!(scheduler::Scheduler),
         docs!(service::Service),

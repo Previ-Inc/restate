@@ -28,6 +28,7 @@ use restate_storage_query_datafusion as v1;
 use restate_types::cluster::cluster_state::LegacyClusterState;
 use restate_types::config::{Configuration, QueryEngineOptions};
 use restate_types::partitions::state::PartitionReplicaSetStates;
+use restate_types::schema::Schema;
 use restate_worker_api::ProcessorsManagerHandle;
 
 use crate::{BuildError, introspection};
@@ -36,6 +37,7 @@ use crate::{BuildError, introspection};
 pub(crate) struct QueryEngineBuilder {
     env: v1::DataFusionEnv,
     scanners: v1::remote_query_scanner_manager::RemoteScannerManager,
+    proto_registry: v1::proto_schema::DynamicProtoSchemaRegistry<Schema>,
     distributed: Option<(v2::DataFusionEnv, v2::source_registry::SourceRegistry)>,
     metadata: Metadata,
     replica_set_states: PartitionReplicaSetStates,
@@ -51,6 +53,11 @@ impl QueryEngineBuilder {
         let routing = PartitionRouting::new(replica_set_states.clone(), TaskCenter::current());
         let env = v1::DataFusionEnv::from_options(&config.admin.query_engine)
             .map_err(v1::BuildError::from)?;
+        let proto_registry =
+            v1::proto_schema::DynamicProtoSchemaRegistry::new(metadata.updateable_schema());
+        for udf in v1::proto_schema::udf::create_udfs(proto_registry.clone()) {
+            env.register_udf(udf).map_err(v1::BuildError::from)?;
+        }
         let scanners = v1::remote_query_scanner_manager::RemoteScannerManager::new(
             v1::remote_query_scanner_client::create_remote_scanner_service(networking.clone()),
             v1::remote_query_scanner_manager::create_partition_locator(
@@ -65,6 +72,11 @@ impl QueryEngineBuilder {
                 .map_err(v2::BuildError::from)?
                 .with_runtime(Arc::clone(env.runtime()))
                 .with_distributed_execution(networking);
+            for udf in v1::proto_schema::udf::create_udfs(proto_registry.clone()) {
+                distributed_env
+                    .register_udf(udf)
+                    .map_err(v2::BuildError::from)?;
+            }
             let scanners = v2::source_registry::SourceRegistry::new(
                 v2::source_registry::create_partition_locator(routing, metadata.clone()),
                 metadata.clone(),
@@ -78,6 +90,7 @@ impl QueryEngineBuilder {
             env,
             scanners,
             distributed,
+            proto_registry,
             metadata,
             replica_set_states,
         })
@@ -92,8 +105,9 @@ impl QueryEngineBuilder {
         metadata_store_client: &MetadataStoreClient,
     ) {
         if let Some((_, scanners)) = &self.distributed {
-            v2::local_scanners::register_metadata_scanners(
+            v2::local_scanners::register_metadata_scanners_with_proto_registry(
                 self.metadata.updateable_schema(),
+                self.proto_registry.clone(),
                 metadata_store_client.clone(),
                 processor_manager.map(ProcessorsManagerHandle::rule_book_observer),
                 scanners,
@@ -206,11 +220,14 @@ impl QueryEngineBuilder {
         self.env
             .register_tables(
                 v1::UserTables::new(v1::context::SelectPartitionsFromMetadata, self.scanners)
-                    .with_metadata(v1::MetadataTables::new(
-                        self.metadata.updateable_schema(),
-                        metadata_store_client,
-                        local_rule_book_observer,
-                    )),
+                    .with_metadata(
+                        v1::MetadataTables::new(
+                            self.metadata.updateable_schema(),
+                            metadata_store_client,
+                            local_rule_book_observer,
+                        )
+                        .with_proto_registry(self.proto_registry),
+                    ),
             )
             .await?;
         // One `/query` rate limit per node, shared by both engines.

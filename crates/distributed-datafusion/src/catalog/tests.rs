@@ -780,6 +780,7 @@ async fn shared_tables_preserve_v1_column_contracts() {
         "sys_vqueues",
         "sys_service",
         "sys_deployment",
+        "sys_proto_schemas",
         "sys_rules",
         "bifrost_read_streams",
         "config",

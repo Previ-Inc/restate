@@ -18,6 +18,7 @@ use crate::tables::journal::SysJournalTable;
 use crate::tables::journal_events::SysJournalEventsTable;
 use crate::tables::locks::SysLocksTable;
 use crate::tables::promise::SysPromiseTable;
+use crate::tables::proto_schemas::schema::SysProtoSchemasTable;
 use crate::tables::rules::schema::SysRulesTable;
 use crate::tables::scheduler_status::schema::SysSchedulerTable;
 use crate::tables::service::schema::SysServiceTable;
@@ -85,6 +86,11 @@ impl RegisterTable for MetadataTables {
             "public",
             &SysDeploymentTable::identity(),
             SysDeploymentTable::create_provider(self.sources.clone()),
+        )?;
+        inventory.add::<SysProtoSchemasTable>(
+            "public",
+            &SysProtoSchemasTable::identity(),
+            SysProtoSchemasTable::create_provider(self.sources.clone()),
         )?;
         inventory.add::<SysRulesTable>(
             "public",

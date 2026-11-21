@@ -75,6 +75,13 @@ pub static SQL_TABLES: &[SqlTableDoc] = &[
         SqlColumnDoc { name: "completion_success_value_utf8", ty: "Utf8", description: "The completion success as UTF-8 string, if any." },
         SqlColumnDoc { name: "completion_failure", ty: "Utf8", description: "The completion failure, if any." },
     ] },
+    SqlTableDoc { name: "sys_proto_schemas", description: "Dynamically registered Protobuf schemas for Virtual Object and Workflow state. Populated automatically from service discovery metadata (`proto.descriptor_set` and `proto.state.<key>`).", columns: &[
+        SqlColumnDoc { name: "service_name", ty: "Utf8", description: "The name of the registered user service." },
+        SqlColumnDoc { name: "revision", ty: "UInt64", description: "The revision of the service that registered this schema." },
+        SqlColumnDoc { name: "state_key", ty: "Utf8", description: "The state key mapped to this Protobuf message (or `*` for wildcard default)." },
+        SqlColumnDoc { name: "message_name", ty: "Utf8", description: "Fully qualified Protobuf message name (e.g. `acme.v1.UserProfile`)." },
+        SqlColumnDoc { name: "fields_json", ty: "Utf8", description: "JSON array describing all fields (`name`, `number`, `type`, `repeated`, `map`) of the message." },
+    ] },
     SqlTableDoc { name: "sys_rules", description: "Rules that limit concurrency. Each rule matches invocations by pattern and can cap how many of them run at the same time.", columns: &[
         SqlColumnDoc { name: "pattern", ty: "Utf8", description: "Rule pattern in canonical display form (e.g. `scope/*/tenant`)." },
         SqlColumnDoc { name: "concurrency", ty: "UInt32", description: "Concurrency limit imposed by this rule. Null means the rule does not constrain concurrency." },
@@ -277,4 +284,4 @@ pub static SQL_TABLES: &[SqlTableDoc] = &[
     ] },
 ];
 
-pub static SQL_TABLES_HELP: &str = "Queryable introspection tables:\n  sys_deployment, sys_inbox, sys_journal, sys_journal_events, sys_locks, sys_promise, sys_rules, sys_scheduler, sys_service, state, sys_user_limits, sys_vqueue_entry_status, sys_vqueue_meta, sys_vqueues, sys_invocation\n\nRun `restate sql describe <table>` for a table's columns.";
+pub static SQL_TABLES_HELP: &str = "Queryable introspection tables:\n  sys_deployment, sys_inbox, sys_journal, sys_journal_events, sys_locks, sys_promise, sys_proto_schemas, sys_rules, sys_scheduler, sys_service, state, sys_user_limits, sys_vqueue_entry_status, sys_vqueue_meta, sys_vqueues, sys_invocation\n\nRun `restate sql describe <table>` for a table's columns.";

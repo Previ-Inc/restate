@@ -12,20 +12,23 @@
 
 use std::borrow::Cow;
 
+use base64::Engine;
 use serde_json::{Map, Number, Value};
 
 use super::{
-    CompiledDescriptorPool, CompiledField, CompiledMessageSchema, FieldKind,
+    CompiledDescriptorPool, CompiledField, CompiledMapKey, CompiledMessageSchema, FieldKind,
     MAX_PROTO_RECURSION_DEPTH, PathStep,
 };
 
 const WIRE_VARINT: u8 = 0;
 const WIRE_I64: u8 = 1;
 const WIRE_LEN: u8 = 2;
+const WIRE_SGROUP: u8 = 3;
+const WIRE_EGROUP: u8 = 4;
 const WIRE_I32: u8 = 5;
 
 const MAX_JSON_VALUES: usize = 65_536;
-#[inline]
+pub(crate) const MAX_JSON_BYTES: usize = 16 * 1024 * 1024;
 pub fn read_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
     if *pos < buf.len() {
         let b0 = buf[*pos];
@@ -83,6 +86,43 @@ fn read_fixed<const N: usize>(buf: &[u8], pos: &mut usize) -> Option<[u8; N]> {
 
 #[inline]
 pub fn skip_wire_value(buf: &[u8], pos: &mut usize, wire_type: u8) -> bool {
+    skip_wire_value_depth(buf, pos, 0, wire_type, 0)
+}
+
+fn skip_wire_value_depth(
+    buf: &[u8],
+    pos: &mut usize,
+    field_num: u32,
+    wire_type: u8,
+    depth: usize,
+) -> bool {
+    match wire_type {
+        WIRE_VARINT => read_varint(buf, pos).is_some(),
+        WIRE_I64 => read_fixed::<8>(buf, pos).is_some(),
+        WIRE_LEN => read_len_delimited(buf, pos).is_some(),
+        WIRE_I32 => read_fixed::<4>(buf, pos).is_some(),
+        WIRE_SGROUP => {
+            if field_num == 0 || depth >= MAX_PROTO_RECURSION_DEPTH {
+                return false;
+            }
+            loop {
+                let Some((inner_num, inner_wire)) = read_wire_tag(buf, pos) else {
+                    return false;
+                };
+                if inner_wire == WIRE_EGROUP {
+                    return inner_num == field_num;
+                }
+                if !skip_wire_value_depth(buf, pos, inner_num, inner_wire, depth + 1) {
+                    return false;
+                }
+            }
+        }
+        _ => false,
+    }
+}
+
+#[inline]
+fn skip_descriptor_wire_value(buf: &[u8], pos: &mut usize, wire_type: u8) -> bool {
     match wire_type {
         WIRE_VARINT => read_varint(buf, pos).is_some(),
         WIRE_I64 => read_fixed::<8>(buf, pos).is_some(),
@@ -90,6 +130,80 @@ pub fn skip_wire_value(buf: &[u8], pos: &mut usize, wire_type: u8) -> bool {
         WIRE_I32 => read_fixed::<4>(buf, pos).is_some(),
         _ => false,
     }
+}
+
+fn validate_descriptor_proto_wire(buf: &[u8], nesting: usize, max_nesting: usize) -> bool {
+    if nesting > max_nesting {
+        return false;
+    }
+    let mut pos = 0;
+    while pos < buf.len() {
+        let Some((field_num, wire_type)) = read_wire_tag(buf, &mut pos) else {
+            return false;
+        };
+        if field_num == 3 {
+            if wire_type != WIRE_LEN {
+                return false;
+            }
+            let Some(nested_buf) = read_len_delimited(buf, &mut pos) else {
+                return false;
+            };
+            if !validate_descriptor_proto_wire(nested_buf, nesting + 1, max_nesting) {
+                return false;
+            }
+        } else if !skip_descriptor_wire_value(buf, &mut pos, wire_type) {
+            return false;
+        }
+    }
+    true
+}
+
+fn validate_file_descriptor_proto_wire(buf: &[u8], max_nesting: usize) -> bool {
+    let mut pos = 0;
+    while pos < buf.len() {
+        let Some((field_num, wire_type)) = read_wire_tag(buf, &mut pos) else {
+            return false;
+        };
+        if field_num == 4 {
+            if wire_type != WIRE_LEN {
+                return false;
+            }
+            let Some(msg_buf) = read_len_delimited(buf, &mut pos) else {
+                return false;
+            };
+            if !validate_descriptor_proto_wire(msg_buf, 1, max_nesting) {
+                return false;
+            }
+        } else if !skip_descriptor_wire_value(buf, &mut pos, wire_type) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Validates `FileDescriptorSet` wire structure and bounds `DescriptorProto.nested_type` recursion
+/// depth before invoking `prost::Message::decode`.
+pub(crate) fn validate_descriptor_set_wire_nesting(buf: &[u8], max_nesting: usize) -> bool {
+    let mut pos = 0;
+    while pos < buf.len() {
+        let Some((field_num, wire_type)) = read_wire_tag(buf, &mut pos) else {
+            return false;
+        };
+        if field_num == 1 {
+            if wire_type != WIRE_LEN {
+                return false;
+            }
+            let Some(file_buf) = read_len_delimited(buf, &mut pos) else {
+                return false;
+            };
+            if !validate_file_descriptor_proto_wire(file_buf, max_nesting) {
+                return false;
+            }
+        } else if !skip_descriptor_wire_value(buf, &mut pos, wire_type) {
+            return false;
+        }
+    }
+    true
 }
 #[inline]
 fn decode_zigzag64(n: u64) -> i64 {
@@ -175,7 +289,6 @@ impl<'a> DecodedScalar<'a> {
         match self {
             DecodedScalar::Str(s) => Cow::Borrowed(s),
             DecodedScalar::Bytes(b) => {
-                use base64::Engine;
                 Cow::Owned(base64::engine::general_purpose::STANDARD.encode(b))
             }
             DecodedScalar::Bool(b) => Cow::Borrowed(if b { "true" } else { "false" }),
@@ -217,17 +330,23 @@ impl<'a> DecodedScalar<'a> {
     }
 
     #[inline]
-    fn into_json_value(self, kind: &FieldKind, pool: &CompiledDescriptorPool) -> Value {
+    fn into_json_value(self, kind: &FieldKind, ctx: &mut TranscodeCtx<'_>) -> Option<Value> {
         match self {
-            DecodedScalar::Str(s) => Value::String(s.to_string()),
-            DecodedScalar::Bytes(b) => {
-                use base64::Engine;
-                Value::String(base64::engine::general_purpose::STANDARD.encode(b))
+            DecodedScalar::Str(s) => {
+                take_byte_budget(ctx.byte_budget, s.len())?;
+                Some(Value::String(s.to_string()))
             }
-            DecodedScalar::Bool(b) => Value::Bool(b),
-            DecodedScalar::I64(v) => Value::Number(Number::from(v)),
-            DecodedScalar::U64(v) => Value::Number(Number::from(v)),
-            DecodedScalar::F64(v) => Number::from_f64(v).map_or_else(
+            DecodedScalar::Bytes(b) => {
+                let encoded_len = b.len().div_ceil(3).checked_mul(4)?;
+                take_byte_budget(ctx.byte_budget, encoded_len)?;
+                Some(Value::String(
+                    base64::engine::general_purpose::STANDARD.encode(b),
+                ))
+            }
+            DecodedScalar::Bool(b) => Some(Value::Bool(b)),
+            DecodedScalar::I64(v) => Some(Value::Number(Number::from(v))),
+            DecodedScalar::U64(v) => Some(Value::Number(Number::from(v))),
+            DecodedScalar::F64(v) => Some(Number::from_f64(v).map_or_else(
                 || {
                     if v.is_nan() {
                         Value::String("NaN".to_string())
@@ -238,14 +357,15 @@ impl<'a> DecodedScalar<'a> {
                     }
                 },
                 Value::Number,
-            ),
+            )),
             DecodedScalar::Enum(v) => {
                 if let FieldKind::Enum(enum_name) = kind
-                    && let Some(name) = pool.resolve_enum_name(enum_name, v)
+                    && let Some(name) = ctx.pool.resolve_enum_name(enum_name, v)
                 {
-                    Value::String(name.to_string())
+                    take_byte_budget(ctx.byte_budget, name.len())?;
+                    Some(Value::String(name.to_string()))
                 } else {
-                    Value::Number(Number::from(v))
+                    Some(Value::Number(Number::from(v)))
                 }
             }
         }
@@ -274,48 +394,46 @@ fn default_scalar_for_kind(kind: &FieldKind) -> Option<DecodedScalar<'static>> {
 }
 
 #[inline]
-fn map_entry_key_matches(
-    seen_key: Option<Cow<'_, str>>,
-    key_kind: &FieldKind,
-    expected_key: &str,
-    pool: &CompiledDescriptorPool,
-) -> bool {
-    let resolved_key = seen_key.unwrap_or_else(|| {
-        default_scalar_for_kind(key_kind)
-            .map(|d| d.into_cow_str(key_kind, pool))
-            .unwrap_or(Cow::Borrowed(""))
-    });
-    resolved_key.as_ref() == expected_key
+fn map_key_matches(scalar: &DecodedScalar<'_>, expected: &CompiledMapKey) -> bool {
+    match (scalar, expected) {
+        (DecodedScalar::Str(s), CompiledMapKey::Str(exp)) => *s == exp.as_str(),
+        (DecodedScalar::I64(v), CompiledMapKey::I64(exp)) => *v == *exp,
+        (DecodedScalar::U64(v), CompiledMapKey::U64(exp)) => *v == *exp,
+        (DecodedScalar::Bool(b), CompiledMapKey::Bool(exp)) => *b == *exp,
+        _ => false,
+    }
 }
 
 #[inline]
 fn extract_map_entry_scalar<'a>(
     entry_buf: &'a [u8],
     key_kind: &FieldKind,
-    expected_key: &str,
+    expected_key: &CompiledMapKey,
     value_kind: &FieldKind,
-    pool: &CompiledDescriptorPool,
 ) -> Result<Option<DecodedScalar<'a>>, ()> {
     let mut pos = 0;
-    let mut seen_key: Option<Cow<'a, str>> = None;
+    let mut seen_key: Option<DecodedScalar<'a>> = None;
     let mut val_out: Option<DecodedScalar<'a>> = None;
 
     while pos < entry_buf.len() {
         let (fnum, wtype) = read_wire_tag(entry_buf, &mut pos).ok_or(())?;
         if fnum == 1 {
-            let k = decode_wire_scalar(entry_buf, &mut pos, wtype, key_kind)
-                .ok_or(())?
-                .into_cow_str(key_kind, pool);
-            seen_key = Some(k);
+            seen_key = Some(decode_wire_scalar(entry_buf, &mut pos, wtype, key_kind).ok_or(())?);
         } else if fnum == 2 {
             let v = decode_wire_scalar(entry_buf, &mut pos, wtype, value_kind).ok_or(())?;
             val_out = Some(v);
-        } else if !skip_wire_value(entry_buf, &mut pos, wtype) {
+        } else if !skip_wire_value_depth(entry_buf, &mut pos, fnum, wtype, 0) {
             return Err(());
         }
     }
 
-    if !map_entry_key_matches(seen_key, key_kind, expected_key, pool) {
+    let matched = match seen_key {
+        Some(scalar) => map_key_matches(&scalar, expected_key),
+        None => {
+            default_scalar_for_kind(key_kind).is_some_and(|d| map_key_matches(&d, expected_key))
+        }
+    };
+    if !matched {
         return Ok(None);
     }
     Ok(Some(
@@ -326,37 +444,34 @@ fn extract_map_entry_scalar<'a>(
 }
 
 #[inline]
-fn extract_map_entry_subslice<'a>(
-    entry_buf: &'a [u8],
+fn map_entry_matches_key(
+    entry_buf: &[u8],
     key_kind: &FieldKind,
-    expected_key: &str,
-    pool: &CompiledDescriptorPool,
-) -> Result<Option<&'a [u8]>, ()> {
+    expected_key: &CompiledMapKey,
+) -> Result<bool, ()> {
     let mut pos = 0;
-    let mut seen_key: Option<Cow<'a, str>> = None;
-    let mut val_slice: Option<&'a [u8]> = None;
+    let mut seen_key: Option<DecodedScalar<'_>> = None;
 
     while pos < entry_buf.len() {
         let (fnum, wtype) = read_wire_tag(entry_buf, &mut pos).ok_or(())?;
         if fnum == 1 {
-            let k = decode_wire_scalar(entry_buf, &mut pos, wtype, key_kind)
-                .ok_or(())?
-                .into_cow_str(key_kind, pool);
-            seen_key = Some(k);
+            seen_key = Some(decode_wire_scalar(entry_buf, &mut pos, wtype, key_kind).ok_or(())?);
         } else if fnum == 2 {
             if wtype != WIRE_LEN {
                 return Err(());
             }
-            val_slice = Some(read_len_delimited(entry_buf, &mut pos).ok_or(())?);
-        } else if !skip_wire_value(entry_buf, &mut pos, wtype) {
+            let _ = read_len_delimited(entry_buf, &mut pos).ok_or(())?;
+        } else if !skip_wire_value_depth(entry_buf, &mut pos, fnum, wtype, 0) {
             return Err(());
         }
     }
 
-    if !map_entry_key_matches(seen_key, key_kind, expected_key, pool) {
-        return Ok(None);
-    }
-    Ok(Some(val_slice.unwrap_or(&[])))
+    Ok(match seen_key {
+        Some(scalar) => map_key_matches(&scalar, expected_key),
+        None => {
+            default_scalar_for_kind(key_kind).is_some_and(|d| map_key_matches(&d, expected_key))
+        }
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -370,6 +485,7 @@ enum WalkHit<'a> {
 fn walk_sub_message_step<'a>(
     buf: &'a [u8],
     tag: u32,
+    oneof_siblings: &[u32],
     rest: &[PathStep],
     pool: &CompiledDescriptorPool,
 ) -> Result<WalkHit<'a>, ()> {
@@ -392,8 +508,13 @@ fn walk_sub_message_step<'a>(
                 }
                 hit @ (WalkHit::Cleared | WalkHit::Value(_)) => acc = hit,
             }
-        } else if !skip_wire_value(buf, &mut pos, wire_type) {
-            return Err(());
+        } else {
+            if !skip_wire_value_depth(buf, &mut pos, field_num, wire_type, 0) {
+                return Err(());
+            }
+            if oneof_siblings.contains(&field_num) {
+                acc = WalkHit::NotReached;
+            }
         }
     }
     Ok(acc)
@@ -403,12 +524,12 @@ fn walk_map_sub_message_step<'a>(
     buf: &'a [u8],
     tag: u32,
     key_kind: &FieldKind,
-    key_str: &str,
+    expected_key: &CompiledMapKey,
     rest: &[PathStep],
     pool: &CompiledDescriptorPool,
 ) -> Result<WalkHit<'a>, ()> {
     let mut pos = 0;
-    let mut winning_slice: Option<&'a [u8]> = None;
+    let mut winning_entry_buf: Option<&'a [u8]> = None;
 
     while pos < buf.len() {
         let (field_num, wire_type) = read_wire_tag(buf, &mut pos).ok_or(())?;
@@ -417,19 +538,46 @@ fn walk_map_sub_message_step<'a>(
                 return Err(());
             }
             let entry_buf = read_len_delimited(buf, &mut pos).ok_or(())?;
-            if let Some(val_slice) = extract_map_entry_subslice(entry_buf, key_kind, key_str, pool)?
-            {
-                winning_slice = Some(val_slice);
+            if map_entry_matches_key(entry_buf, key_kind, expected_key)? {
+                winning_entry_buf = Some(entry_buf);
             }
-        } else if !skip_wire_value(buf, &mut pos, wire_type) {
+        } else if !skip_wire_value_depth(buf, &mut pos, field_num, wire_type, 0) {
             return Err(());
         }
     }
 
-    match winning_slice {
-        Some(slice) => walk_scalar_steps(slice, rest, pool),
-        None => Ok(WalkHit::NotReached),
+    let Some(entry_buf) = winning_entry_buf else {
+        return Ok(WalkHit::NotReached);
+    };
+
+    let mut epos = 0;
+    let mut saw_value = false;
+    let mut acc = WalkHit::NotReached;
+    while epos < entry_buf.len() {
+        let (fnum, wtype) = read_wire_tag(entry_buf, &mut epos).ok_or(())?;
+        if fnum == 2 {
+            if wtype != WIRE_LEN {
+                return Err(());
+            }
+            saw_value = true;
+            let sub_slice = read_len_delimited(entry_buf, &mut epos).ok_or(())?;
+            match walk_scalar_steps(sub_slice, rest, pool)? {
+                WalkHit::NotReached => {}
+                WalkHit::ParentReached => {
+                    if matches!(acc, WalkHit::NotReached) {
+                        acc = WalkHit::ParentReached;
+                    }
+                }
+                hit @ (WalkHit::Cleared | WalkHit::Value(_)) => acc = hit,
+            }
+        } else if !skip_wire_value_depth(entry_buf, &mut epos, fnum, wtype, 0) {
+            return Err(());
+        }
     }
+    if !saw_value {
+        return walk_scalar_steps(&[], rest, pool);
+    }
+    Ok(acc)
 }
 
 fn walk_scalar_steps<'a>(
@@ -444,12 +592,13 @@ fn walk_scalar_steps<'a>(
 
     if !rest.is_empty() {
         return match first {
-            PathStep::SubMessage { tag } => walk_sub_message_step(buf, *tag, rest, pool),
-            PathStep::MapSubMessage {
+            PathStep::SubMessage {
                 tag,
-                key_kind,
-                key_str,
-            } => walk_map_sub_message_step(buf, *tag, key_kind, key_str, rest, pool),
+                oneof_siblings,
+            } => walk_sub_message_step(buf, *tag, oneof_siblings, rest, pool),
+            PathStep::MapSubMessage { tag, key_kind, key } => {
+                walk_map_sub_message_step(buf, *tag, key_kind, key, rest, pool)
+            }
             PathStep::Field { .. } | PathStep::MapLookup { .. } => Err(()),
         };
     }
@@ -469,7 +618,7 @@ fn walk_scalar_steps<'a>(
                     let v = decode_wire_scalar(buf, &mut pos, wire_type, kind).ok_or(())?;
                     state = WalkHit::Value(v);
                 } else {
-                    if !skip_wire_value(buf, &mut pos, wire_type) {
+                    if !skip_wire_value_depth(buf, &mut pos, field_num, wire_type, 0) {
                         return Err(());
                     }
                     if oneof_siblings.contains(&field_num) {
@@ -482,7 +631,7 @@ fn walk_scalar_steps<'a>(
         PathStep::MapLookup {
             tag,
             key_kind,
-            key_str,
+            key,
             value_kind,
         } => {
             let mut pos = 0;
@@ -494,12 +643,11 @@ fn walk_scalar_steps<'a>(
                         return Err(());
                     }
                     let entry_buf = read_len_delimited(buf, &mut pos).ok_or(())?;
-                    if let Some(v) =
-                        extract_map_entry_scalar(entry_buf, key_kind, key_str, value_kind, pool)?
+                    if let Some(v) = extract_map_entry_scalar(entry_buf, key_kind, key, value_kind)?
                     {
                         state = WalkHit::Value(v);
                     }
-                } else if !skip_wire_value(buf, &mut pos, wire_type) {
+                } else if !skip_wire_value_depth(buf, &mut pos, field_num, wire_type, 0) {
                     return Err(());
                 }
             }
@@ -514,7 +662,6 @@ fn resolve_leaf_or_default<'a, 's>(
     raw: &'a [u8],
     steps: &'s [PathStep],
     pool: &CompiledDescriptorPool,
-    allow_field_default: bool,
 ) -> Option<(DecodedScalar<'a>, &'s FieldKind)> {
     let hit = walk_scalar_steps(raw, steps, pool).ok()?;
     match (hit, steps.last()?) {
@@ -530,7 +677,7 @@ fn resolve_leaf_or_default<'a, 's>(
             PathStep::Field {
                 kind, has_presence, ..
             },
-        ) if allow_field_default && !*has_presence => Some((default_scalar_for_kind(kind)?, kind)),
+        ) if !*has_presence => Some((default_scalar_for_kind(kind)?, kind)),
         _ => None,
     }
 }
@@ -542,32 +689,31 @@ pub fn extract_str<'a>(
     steps: &[PathStep],
     pool: &CompiledDescriptorPool,
 ) -> Option<Cow<'a, str>> {
-    let (scalar, kind) = resolve_leaf_or_default(raw, steps, pool, false)?;
+    let (scalar, kind) = resolve_leaf_or_default(raw, steps, pool)?;
     Some(scalar.into_cow_str(kind, pool))
 }
 
 /// Extract an integer (`i64`) field using zero-allocation wire-tag skipping.
 #[inline]
 pub fn extract_i64(raw: &[u8], steps: &[PathStep], pool: &CompiledDescriptorPool) -> Option<i64> {
-    let (scalar, _kind) = resolve_leaf_or_default(raw, steps, pool, true)?;
+    let (scalar, _kind) = resolve_leaf_or_default(raw, steps, pool)?;
     scalar.into_i64()
 }
 
 /// Extract a floating-point (`f64`) field using zero-allocation wire-tag skipping.
 #[inline]
 pub fn extract_f64(raw: &[u8], steps: &[PathStep], pool: &CompiledDescriptorPool) -> Option<f64> {
-    resolve_leaf_or_default(raw, steps, pool, true).and_then(|pair| pair.0.into_f64())
+    resolve_leaf_or_default(raw, steps, pool).and_then(|pair| pair.0.into_f64())
 }
 
 /// Extract a boolean field using zero-allocation wire-tag skipping.
 #[inline]
 pub fn extract_bool(raw: &[u8], steps: &[PathStep], pool: &CompiledDescriptorPool) -> Option<bool> {
-    let (DecodedScalar::Bool(b), _) = resolve_leaf_or_default(raw, steps, pool, true)? else {
+    let (DecodedScalar::Bool(b), _) = resolve_leaf_or_default(raw, steps, pool)? else {
         return None;
     };
     Some(b)
 }
-#[inline]
 fn packed_element_wire_type(kind: &FieldKind) -> Option<u8> {
     match kind {
         FieldKind::Int32
@@ -609,9 +755,20 @@ fn clear_oneof_siblings_json(
     field: &CompiledField,
     msg: &CompiledMessageSchema,
 ) {
-    for &sib_tag in field.oneof_siblings.iter() {
-        if let Some(sib) = msg.fields_by_tag.get(&sib_tag) {
-            map.swap_remove(&sib.name);
+    if map.is_empty() || field.oneof_siblings.is_empty() {
+        return;
+    }
+    if map.len() < field.oneof_siblings.len() {
+        map.retain(|k, _| {
+            msg.fields_by_name
+                .get(k)
+                .is_none_or(|f| !field.oneof_siblings.contains(&f.number))
+        });
+    } else {
+        for &sib_tag in field.oneof_siblings.iter() {
+            if let Some(sib) = msg.fields_by_tag.get(&sib_tag) {
+                map.swap_remove(&sib.name);
+            }
         }
     }
 }
@@ -620,9 +777,13 @@ fn merge_message_json(
     dst: &mut Map<String, Value>,
     src: Map<String, Value>,
     msg: &CompiledMessageSchema,
-    pool: &CompiledDescriptorPool,
-) {
+    ctx: &mut TranscodeCtx<'_>,
+) -> Option<()> {
+    if ctx.depth >= MAX_PROTO_RECURSION_DEPTH {
+        return None;
+    }
     for (k, v) in src {
+        take_budget(ctx.budget)?;
         let Some(field) = msg.fields_by_name.get(&k) else {
             dst.insert(k, v);
             continue;
@@ -633,7 +794,10 @@ fn merge_message_json(
         if field.map_entry.is_some() {
             match (dst.get_mut(&k), v) {
                 (Some(Value::Object(dst_map)), Value::Object(src_map)) => {
-                    dst_map.extend(src_map);
+                    for (mk, mv) in src_map {
+                        take_budget(ctx.budget)?;
+                        dst_map.insert(mk, mv);
+                    }
                 }
                 (_, v) => {
                     dst.insert(k, v);
@@ -644,7 +808,10 @@ fn merge_message_json(
         if field.is_repeated {
             match (dst.get_mut(&k), v) {
                 (Some(Value::Array(dst_arr)), Value::Array(src_arr)) => {
-                    dst_arr.extend(src_arr);
+                    for elem in src_arr {
+                        take_budget(ctx.budget)?;
+                        dst_arr.push(elem);
+                    }
                 }
                 (_, v) => {
                     dst.insert(k, v);
@@ -653,11 +820,17 @@ fn merge_message_json(
             continue;
         }
         if let FieldKind::Message(sub_name) = &field.kind
-            && let Some(sub_schema) = pool.resolve_message(sub_name)
+            && let Some(sub_schema) = ctx.pool.resolve_message(sub_name)
         {
             match (dst.get_mut(&k), v) {
                 (Some(Value::Object(dst_child)), Value::Object(src_child)) => {
-                    merge_message_json(dst_child, src_child, sub_schema, pool);
+                    let mut sub_ctx = TranscodeCtx {
+                        pool: ctx.pool,
+                        depth: ctx.depth + 1,
+                        budget: ctx.budget,
+                        byte_budget: ctx.byte_budget,
+                    };
+                    merge_message_json(dst_child, src_child, sub_schema, &mut sub_ctx)?;
                 }
                 (_, v) => {
                     dst.insert(k, v);
@@ -667,6 +840,7 @@ fn merge_message_json(
         }
         dst.insert(k, v);
     }
+    Some(())
 }
 
 #[inline]
@@ -677,10 +851,18 @@ fn take_budget(budget: &mut usize) -> Option<()> {
     *budget -= 1;
     Some(())
 }
+
+#[inline]
+fn take_byte_budget(byte_budget: &mut usize, bytes: usize) -> Option<()> {
+    *byte_budget = byte_budget.checked_sub(bytes)?;
+    Some(())
+}
+
 struct TranscodeCtx<'a> {
     pool: &'a CompiledDescriptorPool,
     depth: usize,
     budget: &'a mut usize,
+    byte_budget: &'a mut usize,
 }
 
 /// Dynamically transcode a binary Protobuf payload into a `serde_json::Value` using its descriptor.
@@ -690,10 +872,12 @@ pub fn transcode_to_json(
     pool: &CompiledDescriptorPool,
 ) -> Option<Value> {
     let mut budget = MAX_JSON_VALUES;
+    let mut byte_budget = MAX_JSON_BYTES;
     let mut ctx = TranscodeCtx {
         pool,
         depth: 0,
         budget: &mut budget,
+        byte_budget: &mut byte_budget,
     };
     transcode_to_json_inner(buf, msg, &mut ctx)
 }
@@ -714,7 +898,7 @@ fn transcode_to_json_inner(
         let (field_num, wire_type) = read_wire_tag(buf, &mut pos)?;
 
         let Some(field) = msg.fields_by_tag.get(&field_num) else {
-            if !skip_wire_value(buf, &mut pos, wire_type) {
+            if !skip_wire_value_depth(buf, &mut pos, field_num, wire_type, 0) {
                 return None;
             }
             continue;
@@ -773,7 +957,13 @@ fn transcode_to_json_inner(
             && let Some(Value::Object(existing_obj)) = map.get_mut(&field.name)
             && let Value::Object(new_obj) = decoded_val
         {
-            merge_message_json(existing_obj, new_obj, sub_schema, ctx.pool);
+            let mut sub_ctx = TranscodeCtx {
+                pool: ctx.pool,
+                depth: ctx.depth + 1,
+                budget: ctx.budget,
+                byte_budget: ctx.byte_budget,
+            };
+            merge_message_json(existing_obj, new_obj, sub_schema, &mut sub_ctx)?;
         } else {
             map.insert(field.name.clone(), decoded_val);
         }
@@ -799,14 +989,17 @@ fn decode_map_entry_json(
         pool: ctx.pool,
         depth: ctx.depth + 1,
         budget: ctx.budget,
+        byte_budget: ctx.byte_budget,
     };
 
     while pos < entry_buf.len() {
         let (fnum, wtype) = read_wire_tag(entry_buf, &mut pos)?;
         if fnum == 1 {
-            let k = decode_wire_scalar(entry_buf, &mut pos, wtype, key_kind)?
-                .into_cow_str(key_kind, sub_ctx.pool);
-            key_str = Some(k.into_owned());
+            let scalar = decode_wire_scalar(entry_buf, &mut pos, wtype, key_kind)?;
+            if let DecodedScalar::Str(s) = scalar {
+                take_byte_budget(sub_ctx.byte_budget, s.len())?;
+            }
+            key_str = Some(scalar.into_cow_str(key_kind, sub_ctx.pool).into_owned());
         } else if fnum == 2 {
             let decoded =
                 decode_single_field_json(entry_buf, &mut pos, wtype, value_kind, &mut sub_ctx)?;
@@ -815,11 +1008,11 @@ fn decode_map_entry_json(
                 && let Some(Value::Object(existing_obj)) = val_json.as_mut()
                 && let Value::Object(new_obj) = decoded
             {
-                merge_message_json(existing_obj, new_obj, sub_schema, sub_ctx.pool);
+                merge_message_json(existing_obj, new_obj, sub_schema, &mut sub_ctx)?;
             } else {
                 val_json = Some(decoded);
             }
-        } else if !skip_wire_value(entry_buf, &mut pos, wtype) {
+        } else if !skip_wire_value_depth(entry_buf, &mut pos, fnum, wtype, 0) {
             return None;
         }
     }
@@ -847,9 +1040,10 @@ fn decode_single_field_json(
             pool: ctx.pool,
             depth: ctx.depth + 1,
             budget: ctx.budget,
+            byte_budget: ctx.byte_budget,
         };
         return transcode_to_json_inner(sub_buf, sub_schema, &mut sub_ctx);
     }
     take_budget(ctx.budget)?;
-    Some(decode_wire_scalar(buf, pos, wire_type, kind)?.into_json_value(kind, ctx.pool))
+    decode_wire_scalar(buf, pos, wire_type, kind)?.into_json_value(kind, ctx)
 }

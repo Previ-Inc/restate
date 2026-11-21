@@ -115,7 +115,8 @@ pub(super) const SYS_INVOCATION_VIEW: &str = "CREATE VIEW restate.public.sys_inv
 /// Live tables are always registered. Their backend determines whether live rows are available;
 /// offline backends return empty live data for restored partitions, and a partition without a
 /// leader contributes no live rows. Without [`MetadataTables`],
-/// `sys_service`, `sys_deployment`, and `sys_rules` are absent from the catalog.
+/// `sys_service`, `sys_deployment`, `sys_proto_schemas`, `sys_rules`, and the `proto_*` UDFs
+/// are absent from the catalog.
 pub struct UserTables<P, M = ()> {
     partition_selector: P,
     remote_scanner_manager: RemoteScannerManager,
@@ -140,12 +141,15 @@ impl<P> UserTables<P> {
     }
 }
 
-/// Dependencies for the service, deployment, and rule tables. Supply this group only when
-/// cluster metadata is available; offline partition snapshots do not contain that metadata.
+/// Dependencies for the service, deployment, proto schema (including `proto_*` UDFs), and rule
+/// tables. Supply this group only when cluster metadata is available; offline partition snapshots
+/// do not contain that metadata.
 pub struct MetadataTables<S> {
     rule_book_observer: Option<Arc<dyn RuleBookObserver>>,
     schemas: Live<S>,
     metadata_store_client: MetadataStoreClient,
+    proto_registry: Option<crate::proto_schema::DynamicProtoSchemaRegistry<S>>,
+    register_proto_udfs: bool,
 }
 
 impl<S> MetadataTables<S> {
@@ -158,7 +162,21 @@ impl<S> MetadataTables<S> {
             rule_book_observer,
             schemas,
             metadata_store_client,
+            proto_registry: None,
+            register_proto_udfs: true,
         }
+    }
+
+    /// Reuses an existing [`DynamicProtoSchemaRegistry`](crate::proto_schema::DynamicProtoSchemaRegistry)
+    /// for `sys_proto_schemas` and skips registering `proto_*` UDFs when the caller has already
+    /// registered them on the shared environment.
+    pub fn with_proto_registry(
+        mut self,
+        registry: crate::proto_schema::DynamicProtoSchemaRegistry<S>,
+    ) -> Self {
+        self.proto_registry = Some(registry);
+        self.register_proto_udfs = false;
+        self
     }
 }
 
@@ -177,14 +195,17 @@ where
             "sys_service",
             SysServiceTable::create_provider(self.schemas.clone()),
         )?;
-        let proto_registry =
-            crate::proto_schema::DynamicProtoSchemaRegistry::new(self.schemas.clone());
+        let proto_registry = self.proto_registry.clone().unwrap_or_else(|| {
+            crate::proto_schema::DynamicProtoSchemaRegistry::new(self.schemas.clone())
+        });
         inventory.add::<SysProtoSchemasTable>(
             "public",
             "sys_proto_schemas",
             SysProtoSchemasTable::create_provider(proto_registry.clone()),
         )?;
-        crate::proto_schema::udf::register_udfs(inventory, proto_registry);
+        if self.register_proto_udfs {
+            crate::proto_schema::udf::register_udfs(inventory, proto_registry)?;
+        }
         inventory.add::<SysRulesTable>(
             "public",
             "sys_rules",

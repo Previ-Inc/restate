@@ -44,6 +44,12 @@ pub trait ServiceMetadataResolver {
     fn list_services(&self) -> Vec<ServiceMetadata>;
 
     fn list_service_names(&self) -> Vec<String>;
+
+    /// Whether this resolver represents an immutable snapshot (such as `Schema` inside `Live<Schema>`)
+    /// rather than an interior-mutable implementation (such as test mocks).
+    fn is_immutable_snapshot(&self) -> bool {
+        false
+    }
 }
 
 /// Metadata of a registered service.
